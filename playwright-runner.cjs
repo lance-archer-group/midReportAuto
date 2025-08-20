@@ -262,55 +262,201 @@ async function waitFor2faCode() {
   console.log('Got 2FA code.');
   return code;
 }
-export async function get2faCodeFromImap(user: string, pass: string) {
-  const client = new ImapFlow({
-    host: 'imap.gmail.com',
-    port: 993,
-    secure: true,
-    auth: { user, pass },
-  });
-
+// ===== IMAP 2FA Helper (patched) ============================================
+// ANCHOR: get2fa
+function fmtTZ(date, tz) {
   try {
-    await client.connect();
+    return new Intl.DateTimeFormat('en-US', {
+      timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
+    }).format(date);
+  } catch {
+    return '(tz format unavailable)';
+  }
+}
+function maskUser(u) {
+  if (!u) return '';
+  const [name, host] = String(u).split('@');
+  return `${name?.slice(0, 2) || ''}***@${host || ''}`;
+}
 
-    // Always open [Gmail]/All Mail
-    const lock = await client.getMailboxLock('[Gmail]/All Mail');
+async function waitFor2faCode() {
+  console.log('[2FA] Waiting for newest 2FA email via IMAP…');
+  const code = await get2faCodeFromImap();
+  if (code) console.log('[2FA] Got 2FA code.');
+  else console.log('[2FA] No 2FA code found within window.');
+  return code;
+}
+
+/**
+ * Robust IMAP 2FA code fetcher.
+ * - Looks in IMAP_MAILBOX (defaults INBOX) then optional IMAP_ALT_MAILBOX.
+ * - Does NOT depend on mailbox/server timezone; verifies with message INTERNALDATE.
+ * - Optional Gmail RAW search for tighter time windows.
+ * - Never requires Unread; filters by subject/from and regex instead.
+ *
+ * Env knobs (all optional):
+ *   IMAP_HOST, IMAP_PORT=993, IMAP_SECURE=true, IMAP_USER, IMAP_PASS
+ *   IMAP_MAILBOX="INBOX"             IMAP_ALT_MAILBOX="[Gmail]/All Mail"
+ *   IMAP_LOOKBACK_MIN=240            IMAP_WINDOW_FUDGE_MIN=10
+ *   IMAP_MAX_SCAN=50                 IMAP_FROM_FILTER=""
+ *   IMAP_SUBJECT_FILTER="Elevate MFA Code"
+ *   IMAP_CODE_REGEX="\\b\\d{6}\\b"   IMAP_DEBUG=(true|false)
+ *   LOCAL_TZ="America/Boise"         IMAP_USE_GMAIL_RAW=(true|false, default auto for gmail hosts)
+ */
+async function get2faCodeFromImap(opts = {}) {
+  const debug = /^(1|true|yes|on)$/i.test(String(process.env.IMAP_DEBUG || ''));
+  const log = (...a) => (debug ? console.log('[IMAP]', ...a) : void 0);
+
+  // Auth / connection
+  const host   = env('IMAP_HOST', 'imap.gmail.com');
+  const port   = numEnv('IMAP_PORT', 993);
+  const secure = bool(env('IMAP_SECURE', 'true'), true);
+  const user   = opts.user ?? env('IMAP_USER');
+  const pass   = opts.pass ?? env('IMAP_PASS');
+
+  if (!user || !pass) throw new Error('IMAP_USER/IMAP_PASS missing');
+
+  // Search controls
+  const mailbox     = env('IMAP_MAILBOX', 'INBOX');
+  const altMailbox  = env('IMAP_ALT_MAILBOX', '[Gmail]/All Mail');
+  const fromFilter  = (env('IMAP_FROM_FILTER', '') || '').trim();
+  const subjectFilter = (env('IMAP_SUBJECT_FILTER', 'Elevate MFA Code') || '').trim();
+  const lookbackMin = numEnv('IMAP_LOOKBACK_MIN', 240);
+  const fudgeMin    = numEnv('IMAP_WINDOW_FUDGE_MIN', 10); // tolerate clock skew
+  const maxScan     = numEnv('IMAP_MAX_SCAN', 50);
+  const codeRegex   = new RegExp(env('IMAP_CODE_REGEX', '\\b\\d{6}\\b'));
+
+  const localTZ     = env('LOCAL_TZ', 'America/Boise');
+  const now         = new Date();
+  const cutoffMS    = now.getTime() - (lookbackMin + fudgeMin) * 60 * 1000;
+
+  // Prefer Gmail RAW only when obvious
+  const hostIsGmail = /gmail|googlemail/i.test(host);
+  const useGmailRaw = /^(1|true|yes|on)$/i.test(String(process.env.IMAP_USE_GMAIL_RAW ?? (hostIsGmail ? 'true' : 'false')));
+
+  log('connect', { host, port, secure, user: maskUser(user) });
+  log('time.now.utc', now.toISOString());
+  log('time.now.local', fmtTZ(now, localTZ));
+  log('tz.offset.minutes', new Date().getTimezoneOffset());
+  log('search', { mailbox, altMailbox, lookbackMin, fudgeMin, maxScan, fromFilter, subjectFilter, useGmailRaw });
+
+  const client = new ImapFlow({ host, port, secure, auth: { user, pass } });
+
+  // helper: scan a mailbox and try to extract code
+  const scanMailbox = async (mboxName) => {
+    // Use lock to ensure stable view
+    const lock = await client.getMailboxLock(mboxName);
     try {
-      const since = new Date(Date.now() - 1000 * 60 * 240); // 240 minutes lookback
+      let uids = [];
 
-      // Don’t filter by \Seen
-      const searchCriteria = { since };
+      if (useGmailRaw) {
+        // Gmail RAW: e.g., newer_than:20m subject:"..." from:"..."
+        const parts = [`newer_than:${lookbackMin + fudgeMin}m`];
+        if (subjectFilter) parts.push(`subject:"${subjectFilter.replace(/"/g, '\\"')}"`);
+        if (fromFilter)    parts.push(`from:"${fromFilter.replace(/"/g, '\\"')}"`);
+        const gmailRaw = parts.join(' ');
+        log('gmailRaw', gmailRaw);
+        uids = await client.search({ gmailRaw }, { uid: true });
+      } else {
+        // Generic: use SINCE date (date-only in IMAP), then post-filter by INTERNALDATE.
+        // If empty (timezone boundary), widen by 1 day.
+        const primarySince = new Date(cutoffMS);
+        uids = await client.search({ since: primarySince }, { uid: true });
 
-      const messages = await client.search(searchCriteria, { uid: true });
-      if (!messages.length) {
-        console.log('No messages found in [Gmail]/All Mail within lookback window.');
-        return null;
+        if (!uids.length) {
+          const widened = new Date(cutoffMS - 24 * 60 * 60 * 1000);
+          log('since.widened', widened.toISOString());
+          uids = await client.search({ since: widened }, { uid: true });
+        }
       }
 
-      // Fetch newest first
-      const latestUid = messages[messages.length - 1];
-      const msg = await client.fetchOne(latestUid, { source: true });
-      const parsed = await simpleParser(msg.source);
+      log(`${mboxName}.uids`, { count: uids.length });
 
-      // Regex for 2FA code — adjust if your provider’s emails differ
-      const match = parsed.text?.match(/\b\d{6}\b/);
-      if (match) {
-        console.log('✅ Found 2FA code:', match[0]);
-        return match[0];
+      if (!uids.length) return null;
+
+      // Newest first; cap the scan to maxScan
+      const scanList = uids.slice(-maxScan).reverse();
+
+      for (const uid of scanList) {
+        const msg = await client.fetchOne(uid, { uid: true, envelope: true, internalDate: true, source: true });
+        if (!msg) continue;
+
+        const idate = msg.internalDate ? new Date(msg.internalDate) : null;
+        const idateMs = idate?.getTime?.() ?? 0;
+
+        // Post-filter by cutoff (defeats server TZ ambiguity)
+        if (idate && idateMs < cutoffMS) {
+          log('skip.old', { uid, internalDate: idate.toISOString() });
+          continue;
+        }
+
+        // Parse minimally
+        let parsed;
+        try {
+          parsed = await simpleParser(msg.source);
+        } catch (e) {
+          log('parse.fail', { uid, err: e?.message || String(e) });
+          continue;
+        }
+
+        const subj = parsed.subject || '';
+        const from = (parsed.from?.value || []).map(v => `${v.name || ''} <${v.address || ''}>`).join(', ');
+
+        // Subject/from filters (if provided)
+        if (subjectFilter && !new RegExp(subjectFilter, 'i').test(subj)) {
+          log('skip.subject', { uid, subj });
+          continue;
+        }
+        if (fromFilter && !new RegExp(fromFilter, 'i').test(from)) {
+          log('skip.from', { uid, from });
+          continue;
+        }
+
+        const bodyText = parsed.text || '';
+        const m = bodyText.match(codeRegex);
+        log('inspect', {
+          uid,
+          internalDate: idate ? idate.toISOString() : null,
+          subj: subj.slice(0, 160),
+          from,
+          codeFound: !!m
+        });
+
+        if (m) return m[0];
       }
 
-      console.log('No 2FA code found in latest message.');
       return null;
     } finally {
       lock.release();
     }
+  };
+
+  try {
+    await client.connect();
+
+    // Try primary mailbox, then alt if configured
+    let code = await scanMailbox(mailbox);
+    if (!code && altMailbox) {
+      log('fallback.mailbox', altMailbox);
+      code = await scanMailbox(altMailbox);
+    }
+
+    if (!code) {
+      console.warn('[IMAP] Searched but did not find a matching 2FA code within window.');
+    } else {
+      console.log('[IMAP] ✅ 2FA code found.');
+    }
+    return code;
   } catch (err) {
-    console.error('IMAP error:', err);
+    console.error('[IMAP] error:', err?.message || err);
     throw err;
   } finally {
-    await client.logout().catch(() => {});
+    try { await client.logout(); } catch {}
   }
 }
+// ANCHOR: get2fa:end
+
 
 // ===== Portal Actions ========================================================
 async function login(page) {
