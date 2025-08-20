@@ -942,17 +942,28 @@ async function countSelectedMids(page) {
 // ANCHOR: main
 // ===== Main ==================================================================
 async function main() {
-   console.log('▶️  Playwright Runner starting');
-console.log(`Node: ${process.version} (${process.platform} ${process.arch})`);
-console.log(`CWD: ${process.cwd()}`);
-console.log(`Start: ${new Date().toISOString()}`);
-console.log('Config:', {
-  HEADLESS: env('HEADLESS'),
-  SLOWMO_MS: numEnv('SLOWMO_MS', 0),
-  NAV_TIMEOUT_MS: numEnv('NAV_TIMEOUT_MS', 15000),
-  POST_RUN_PAUSE_MS: numEnv('POST_RUN_PAUSE_MS', 800),
-  LOAD_STATE: env('LOAD_STATE', 'networkidle'),
-});
+  console.log('▶️  Playwright Runner starting');
+  console.log(`Node: ${process.version} (${process.platform} ${process.arch})`);
+  console.log(`CWD: ${process.cwd()}`);
+  console.log(`Start: ${new Date().toISOString()}`);
+
+  const runningInDocker = fs.existsSync('/.dockerenv');
+  const hasDisplay = !!process.env.DISPLAY;
+
+  // Compute one authoritative headless flag
+  const effectiveHeadless =
+    process.env.HEADLESS != null && process.env.HEADLESS !== ''
+      ? /^(true|1|yes|on)$/i.test(process.env.HEADLESS)
+      : (runningInDocker || !hasDisplay);
+
+  console.log('Config:', {
+    HEADLESS: String(effectiveHeadless),
+    SLOWMO_MS: numEnv('SLOWMO_MS', 0),
+    NAV_TIMEOUT_MS: numEnv('NAV_TIMEOUT_MS', 15000),
+    POST_RUN_PAUSE_MS: numEnv('POST_RUN_PAUSE_MS', 800),
+    LOAD_STATE: env('LOAD_STATE', 'networkidle'),
+  });
+
   const { start, end } = getDateRange();
   const dayFolderName = new Intl.DateTimeFormat('en-CA', {
     timeZone: DATE_TZ, year: 'numeric', month: '2-digit', day: '2-digit'
@@ -960,8 +971,7 @@ console.log('Config:', {
   const dayDir = path.join(OUT_ROOT, dayFolderName);
   fs.mkdirSync(dayDir, { recursive: true });
   fs.mkdirSync(ERROR_SHOTS, { recursive: true });
-const runningInDocker = fs.existsSync('/.dockerenv');
-const hasDisplay = !!process.env.DISPLAY;
+
   // Load MIDs
   const merchants = loadMerchants();
   const mids = merchants.map(m => m.id);
@@ -991,13 +1001,11 @@ const hasDisplay = !!process.env.DISPLAY;
   };
 
   // Browser
-const defaultHeadless = (runningInDocker || !hasDisplay) ? 'true' : 'false';
-
-const browser = await chromium.launch({
-  headless: /^(true|1|yes|on)$/i.test(process.env.HEADLESS ?? defaultHeadless),
-  slowMo: Number(process.env.SLOWMO_MS ?? 0) || 0,
-  args: ['--no-sandbox', '--disable-setuid-sandbox'],
-});
+  const browser = await chromium.launch({
+    headless: effectiveHeadless,
+    slowMo: Number(process.env.SLOWMO_MS ?? 0) || 0,
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+  });
 
   const context = await browser.newContext({ acceptDownloads: true });
   const page = await context.newPage();
@@ -1042,29 +1050,28 @@ const browser = await chromium.launch({
     if (SELECTORS.ach?.start_date) await fillDateInput(page, SELECTORS.ach.start_date, formatDateForPortal(start));
     if (SELECTORS.ach?.end_date)   await fillDateInput(page, SELECTORS.ach.end_date,   formatDateForPortal(end));
 
-// --- Run the report ---
-await clickLoadReport(page);
+    // --- Run the report ---
+    await clickLoadReport(page);
 
-// --- Single combined export (NOT per-merchant) ---
-const bulkTag = `-${mids.length}-mids`;
-const bulkPath = await exportCurrentAch(page, dayDir, bulkTag);
+    // --- Single combined export (NOT per-merchant) ---
+    const bulkTag = `-${mids.length}-mids`;
+    const bulkPath = await exportCurrentAch(page, dayDir, bulkTag);
 
-// Mark success for every merchant, referencing the same file
-for (const m of summary.merchants) {
-  m.status = 'ok';
-  m.files = [bulkPath];
-}
+    // Mark success for every merchant, referencing the same file
+    for (const m of summary.merchants) {
+      m.status = 'ok';
+      m.files = [bulkPath];
+    }
 
-// Email the combined export (optional; controlled by env)
-// emailReport(fileArg, overrides) — pass the string path as first arg
-try {
-  await emailReport(bulkPath, {
-    subject: env('EMAIL_SUBJECT', `Net ACH Export ${summary.date} (${mids.length} MIDs)`),
-    text: env('EMAIL_BODY', `Attached is the Net ACH export for ${summary.range.start} to ${summary.range.end}.`)
-  });
-} catch (e) {
-  console.warn('[EMAIL] send failed:', e?.message || e);
-}
+    // --- Email report ---
+    try {
+      await emailReport(bulkPath, {
+        subject: env('EMAIL_SUBJECT', `Net ACH Export ${summary.date} (${mids.length} MIDs)`),
+        text: env('EMAIL_BODY', `Attached is the Net ACH export for ${summary.range.start} to ${summary.range.end}.`)
+      });
+    } catch (e) {
+      console.warn('[EMAIL] send failed:', e?.message || e);
+    }
   } finally {
     // Write summary & teardown
     summarize();
@@ -1080,6 +1087,7 @@ try {
     await browser.close();
   }
 }
+
 if (require.main === module) {
   main().catch(err => {
     console.error(err);
