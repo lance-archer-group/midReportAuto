@@ -262,91 +262,53 @@ async function waitFor2faCode() {
   console.log('Got 2FA code.');
   return code;
 }
-async function get2faCodeFromImap() {
-  const debug = /^(1|true|yes|on)$/i.test(String(process.env.IMAP_DEBUG || ''));
-  const log = (...a) => debug && console.log('[IMAP]', ...a);
-
-  const host = env('IMAP_HOST');
-  const port = numEnv('IMAP_PORT', 993);
-  const secure = bool(env('IMAP_SECURE'), true);
-  const user = env('IMAP_USER');
-  const pass = env('IMAP_PASS');
-  const mailbox = env('IMAP_MAILBOX', 'INBOX');
-  const altMailbox = env('IMAP_ALT_MAILBOX');
-  const fromFilter = (env('IMAP_FROM_FILTER', '') || '').trim();
-  const subjectFilter = (env('IMAP_SUBJECT_FILTER', '') || 'Elevate MFA Code').trim();
-  const codeRegex = new RegExp(env('IMAP_CODE_REGEX', '(?<!\\d)\\d{6}(?!\\d)'));
-  const lookbackMinutes = numEnv('IMAP_LOOKBACK_MINUTES', 60);
-  const onlyUnseen = bool(env('IMAP_ONLY_UNSEEN', 'true'));
-
+export async function get2faCodeFromImap(user: string, pass: string) {
   const client = new ImapFlow({
-    host, port, secure,
+    host: 'imap.gmail.com',
+    port: 993,
+    secure: true,
     auth: { user, pass },
-    logger: false,
-    socketTimeout: numEnv('IMAP_SOCKET_TIMEOUT_MS', 120000),
-    greetingTimeout: numEnv('IMAP_CONN_TIMEOUT_MS', 30000),
-    authTimeout: numEnv('IMAP_AUTH_TIMEOUT_MS', 30000),
-    tls: { servername: env('IMAP_TLS_SERVERNAME', host), minVersion: 'TLSv1.2' },
-    keepalive: { interval: 15000, idleInterval: 300000, forceNoop: true, startAfterIdle: true }
   });
-
-  client.on('error', e => console.warn('[IMAP client error]', e?.message || e));
-
-  const sinceDate = new Date(Date.now() - lookbackMinutes * 60 * 1000);
-
-  const openAndGetCode = async (box) => {
-    log('Opening mailbox:', box);
-    await client.mailboxOpen(box);
-
-    const queries = [
-      (() => { const q = { since: sinceDate }; if (fromFilter) q.from = fromFilter; if (subjectFilter) q.subject = subjectFilter; if (onlyUnseen) q.seen = false; return q; })(),
-      { since: sinceDate, subject: subjectFilter, seen: false },
-      { since: sinceDate, subject: subjectFilter },
-      { since: sinceDate }
-    ];
-
-    let uids = [];
-    for (const q of queries) {
-      try {
-        const found = await client.search(q);
-        log('search', q, '->', found.length);
-        if (found.length) { uids = found; break; }
-      } catch (e) { log('search error:', e?.message || e); }
-    }
-    if (!uids.length) return null;
-
-    uids.sort((a,b)=>b-a);
-    const top = uids.slice(0, 5);
-
-    // SUBJECT
-    for (const uid of top) {
-      const envlp = await client.fetchOne(uid, { envelope: true, headers: true }).catch(()=>null);
-      const subject = envlp?.envelope?.subject || envlp?.headers?.get('subject') || '';
-      const m = subject.match(codeRegex);
-      if (m) return { code: m[0], where: 'subject', uid, subject };
-    }
-    // BODY
-    for (const uid of top) {
-      const msg = await client.fetchOne(uid, { source: true, envelope: true }).catch(()=>null);
-      if (!msg?.source) continue;
-      const parsed = await simpleParser(msg.source).catch(()=>null);
-      if (!parsed) continue;
-      const body = `${parsed.subject || ''}\n${parsed.text || ''}\n${parsed.html || ''}`;
-      const m = body.match(codeRegex);
-      if (m) return { code: m[0], where: 'body', uid, subject: parsed.subject || '' };
-    }
-    return null;
-  };
 
   try {
     await client.connect();
-    let res = await openAndGetCode(mailbox);
-    if (!res && altMailbox) res = await openAndGetCode(altMailbox);
-    if (!res) throw new Error('2FA code not found via IMAP');
-    log('2FA code:', res.code, res.where, res.subject);
-    return res.code;
+
+    // Always open [Gmail]/All Mail
+    const lock = await client.getMailboxLock('[Gmail]/All Mail');
+    try {
+      const since = new Date(Date.now() - 1000 * 60 * 240); // 240 minutes lookback
+
+      // Don’t filter by \Seen
+      const searchCriteria = { since };
+
+      const messages = await client.search(searchCriteria, { uid: true });
+      if (!messages.length) {
+        console.log('No messages found in [Gmail]/All Mail within lookback window.');
+        return null;
+      }
+
+      // Fetch newest first
+      const latestUid = messages[messages.length - 1];
+      const msg = await client.fetchOne(latestUid, { source: true });
+      const parsed = await simpleParser(msg.source);
+
+      // Regex for 2FA code — adjust if your provider’s emails differ
+      const match = parsed.text?.match(/\b\d{6}\b/);
+      if (match) {
+        console.log('✅ Found 2FA code:', match[0]);
+        return match[0];
+      }
+
+      console.log('No 2FA code found in latest message.');
+      return null;
+    } finally {
+      lock.release();
+    }
+  } catch (err) {
+    console.error('IMAP error:', err);
+    throw err;
   } finally {
-    try { await client.logout(); } catch {}
+    await client.logout().catch(() => {});
   }
 }
 
