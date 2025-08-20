@@ -4,9 +4,9 @@
 .env.*
 
 # Reports and generated files
-reports/
+reports/*
 *.log
-
+error_shots/*
 # Node dependencies
 node_modules/
 
