@@ -990,11 +990,11 @@ console.log('Config:', {
   };
 
   // Browser
-  const browser = await chromium.launch({
-  // default to headed (false), can override via HEADLESS env
-  headless: bool(env('HEADLESS', 'true')),
-  // default to 200ms slowMo unless overridden
-  slowMo: numEnv('SLOWMO_MS', 200),
+const defaultHeadless = (runningInDocker || !hasDisplay) ? 'true' : 'false';
+
+const browser = await chromium.launch({
+  headless: /^(true|1|yes|on)$/i.test(process.env.HEADLESS ?? defaultHeadless),
+  slowMo: Number(process.env.SLOWMO_MS ?? 0) || 0,
   args: ['--no-sandbox', '--disable-setuid-sandbox'],
 });
 
