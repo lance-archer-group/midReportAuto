@@ -1,0 +1,20 @@
+# Env & secrets
+.env
+.env.local
+.env.*
+
+# Reports and generated files
+reports/
+*.log
+
+# Node dependencies
+node_modules/
+
+# Build artifacts
+dist/
+out/
+
+# System/editor files
+.DS_Store
+Thumbs.db
+*.swp

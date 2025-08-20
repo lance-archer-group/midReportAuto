@@ -1,0 +1,22 @@
+{
+  "login":   { "username": "#username", "password": "#password", "submit": "button:has-text(\"Login\")" },
+  "twofa":   { "code_input": "#passcode", "submit": "button:has-text(\"Verify code\"), button:has-text(\"Verify\"), input[type=\"submit\"]" },
+  "reporting": {
+    "query_menu": "a:has-text(\"Query System\"), button:has-text(\"Query System\")",
+    "advanced_link": "a[href='/Reporting/ReportSelect.aspx'], a:has-text(\"Advanced Reporting\")",
+    "net_ach_button": "a[href='/Reporting/Report.aspx?reportID=25']",
+    "mid_input": "#MID-catmultiselect",
+    "mid_results_container": "#MID-catmultiselect-resultbox .catMSResultList",
+    "mid_result_item": "#MID-catmultiselect-resultbox .catMSResultList li",
+    "mid_chip": ".catMSValueList li",
+    "run_button": "#load, button:has-text('Load report'), button:has-text('Run'), button:has-text('Search')",
+    "export_buttons": ["button.btn.green.export","button:has-text(\"Export\")","a:has-text(\"Export\")","button:has-text(\"Download\")","a:has-text(\"Download\")"]
+  },
+  "ach": {
+    "merchant_id": "#MID-catmultiselect",
+    "start_date": "#fileDateStart",
+    "end_date": "#fileDateEnd",
+    "load_report": "#load",
+    "export_buttons": ["button.btn.green.export","button:has-text(\"Export\")","a:has-text(\"Export\")","button:has-text(\"Download\")","a:has-text(\"Download\")"]
+  }
+}
