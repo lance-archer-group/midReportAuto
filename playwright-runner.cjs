@@ -24,7 +24,70 @@ function numEnv(key, fallback) {
   const v = Number(process.env[key]);
   return Number.isFinite(v) ? v : fallback;
 }
+// ===== Email helper ==========================================================
+const nodemailer = require('nodemailer');
 
+/**
+ * Email a file attachment (the single combined export).
+ * Respects EMAIL_ENABLED=false to noop in dev.
+ */
+
+async function emailReport(fileArg, overrides = {}) {
+  try {
+    const to = env('EMAIL_TO', '');
+    if (!to) {
+      console.log('[EMAIL] EMAIL_TO not set — skipping send.');
+      return;
+    }
+
+    // Prefer explicit SMTP_*; fall back to IMAP_* you already use for 2FA
+    const host   = env('SMTP_HOST', env('IMAP_HOST', 'smtp.gmail.com').replace(/^imap\./i, 'smtp.'));
+    const port   = numEnv('SMTP_PORT', 465);
+    const secure = bool(env('SMTP_SECURE', 'true'), true);
+    const user   = env('SMTP_USER', env('IMAP_USER'));
+    const pass   = env('SMTP_PASS', env('IMAP_PASS'));
+    const from   = env('EMAIL_FROM', user);
+
+    // ---- normalize attachment input ----
+    let filePath = null;
+    if (typeof fileArg === 'string') {
+      filePath = fileArg;
+    } else if (fileArg && typeof fileArg === 'object' && typeof fileArg.path === 'string') {
+      filePath = fileArg.path;
+    } else {
+      throw new Error('emailReport() expected a string file path or { path: string }');
+    }
+
+    // ensure it exists
+    if (!fs.existsSync(filePath)) {
+      throw new Error(`Attachment not found on disk: ${filePath}`);
+    }
+
+    const filename = overrides.filename || path.basename(filePath);
+    const subject  = overrides.subject || env('EMAIL_SUBJECT', `Net ACH Export ${new Date().toISOString().slice(0,10)}`);
+    const text     = overrides.text || env('EMAIL_BODY', 'Attached is the Net ACH export.');
+    const contentType =
+      path.extname(filename).toLowerCase() === '.xlsx'
+        ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        : undefined;
+
+    console.log('[EMAIL] preparing send', { host, port, secure, to, from, filename });
+
+    const transporter = nodemailer.createTransport({ host, port, secure, auth: { user, pass } });
+
+    const info = await transporter.sendMail({
+      from,
+      to,
+      subject,
+      text,
+      attachments: [{ filename, path: filePath, contentType }],
+    });
+
+    console.log(`[EMAIL] sent ok: messageId=${info.messageId}`);
+  } catch (err) {
+    console.error('[EMAIL] send failed:', err.message || err);
+  }
+}
 // ===== Paths / Project files (env-driven) ====================================
 const ROOT = __dirname;
 const OUTPUT_DIR = env('OUTPUT_DIR', 'reports');
@@ -929,7 +992,7 @@ console.log('Config:', {
   // Browser
   const browser = await chromium.launch({
   // default to headed (false), can override via HEADLESS env
-  headless: bool(env('HEADLESS', 'false')),
+  headless: bool(env('HEADLESS', 'true')),
   // default to 200ms slowMo unless overridden
   slowMo: numEnv('SLOWMO_MS', 200),
   args: ['--no-sandbox', '--disable-setuid-sandbox'],
@@ -978,19 +1041,29 @@ console.log('Config:', {
     if (SELECTORS.ach?.start_date) await fillDateInput(page, SELECTORS.ach.start_date, formatDateForPortal(start));
     if (SELECTORS.ach?.end_date)   await fillDateInput(page, SELECTORS.ach.end_date,   formatDateForPortal(end));
 
-    // --- Run the report (replaces old inline run_button logic) ---
-    await clickLoadReport(page);
+// --- Run the report ---
+await clickLoadReport(page);
 
-    // --- Single combined export (NOT per-merchant) ---
-    const bulkTag = `-${mids.length}-mids`;
-    const bulkPath = await exportCurrentAch(page, dayDir, bulkTag);
+// --- Single combined export (NOT per-merchant) ---
+const bulkTag = `-${mids.length}-mids`;
+const bulkPath = await exportCurrentAch(page, dayDir, bulkTag);
 
-    // Mark success for every merchant, referencing the same file
-    for (const m of summary.merchants) {
-      m.status = 'ok';
-      m.files = [bulkPath];
-    }
+// Mark success for every merchant, referencing the same file
+for (const m of summary.merchants) {
+  m.status = 'ok';
+  m.files = [bulkPath];
+}
 
+// Email the combined export (optional; controlled by env)
+// emailReport(fileArg, overrides) — pass the string path as first arg
+try {
+  await emailReport(bulkPath, {
+    subject: env('EMAIL_SUBJECT', `Net ACH Export ${summary.date} (${mids.length} MIDs)`),
+    text: env('EMAIL_BODY', `Attached is the Net ACH export for ${summary.range.start} to ${summary.range.end}.`)
+  });
+} catch (e) {
+  console.warn('[EMAIL] send failed:', e?.message || e);
+}
   } finally {
     // Write summary & teardown
     summarize();
