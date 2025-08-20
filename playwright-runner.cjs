@@ -960,7 +960,8 @@ console.log('Config:', {
   const dayDir = path.join(OUT_ROOT, dayFolderName);
   fs.mkdirSync(dayDir, { recursive: true });
   fs.mkdirSync(ERROR_SHOTS, { recursive: true });
-
+const runningInDocker = fs.existsSync('/.dockerenv');
+const hasDisplay = !!process.env.DISPLAY;
   // Load MIDs
   const merchants = loadMerchants();
   const mids = merchants.map(m => m.id);
