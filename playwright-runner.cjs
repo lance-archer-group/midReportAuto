@@ -351,120 +351,158 @@ async function waitFor2faCode() {
 }
 
 async function get2faCodeFromImap() {
-  const debug = /^(1|true|yes|on)$/i.test(String(process.env.IMAP_DEBUG || ''));
-  const log = (...a) => debug && console.log('[IMAP]', ...a);
+  const debug = bool(env('IMAP_DEBUG', 'false'));
+  const log   = (...a) => debug && console.log('[IMAP]', ...a);
 
-  const host           = env('IMAP_HOST', 'imap.gmail.com');
-  const port           = numEnv('IMAP_PORT', 993);
-  const secure         = bool(env('IMAP_SECURE'), true);
-  const user           = env('IMAP_USER');
-  const pass           = env('IMAP_PASS');
-  const mailbox        = env('IMAP_MAILBOX', 'INBOX');
-  const altMailbox     = env('IMAP_ALT_MAILBOX', '');
-  const fromFilter     = (env('IMAP_FROM_FILTER', '') || '').trim();
-  const subjectFilter  = (env('IMAP_SUBJECT_FILTER', 'Elevate MFA Code') || '').trim();
-  const lookbackMin    = numEnv('IMAP_LOOKBACK_MINUTES', 60);
-  const onlyUnseen     = bool(env('IMAP_ONLY_UNSEEN', 'true'));
-  const codeRegex      = new RegExp(env('IMAP_CODE_REGEX', '(?<!\\d)\\d{6}(?!\\d)'), 'g');
+  const host        = env('IMAP_HOST', 'imap.gmail.com');
+  const port        = numEnv('IMAP_PORT', 993);
+  const secure      = bool(env('IMAP_SECURE', 'true'), true);
+  const user        = env('IMAP_USER', '');
+  const pass        = env('IMAP_PASS', '');
+
+  const mailboxCsv  = env('IMAP_MAILBOXES', env('IMAP_MAILBOX', 'INBOX'));
+  const altMailbox  = env('IMAP_ALT_MAILBOX', '');
+  const mailboxes   = mailboxCsv.split(',').map(s => s.trim()).filter(Boolean);
+  if (altMailbox) mailboxes.push(altMailbox);
+
+  const fromFilter  = (env('IMAP_FROM_FILTER', '') || '').trim();
+  const subjectFilt = (env('IMAP_SUBJECT_FILTER', 'Elevate MFA Code') || '').trim();
+  const lookbackMin = numEnv('IMAP_LOOKBACK_MINUTES', 60);
+  const onlyUnseen  = bool(env('IMAP_ONLY_UNSEEN', 'false'));
+  const codeRxStr   = env('IMAP_CODE_REGEX', '(?<!\\d)\\d{6}(?!\\d)');
+  const timeSkewMs  = numEnv('IMAP_TIME_SKEW_MS', 0);
+  const uidFudge    = Math.max(5, numEnv('IMAP_UID_FUDGE', 25));
+
+  const since = new Date(Date.now() - lookbackMin * 60 * 1000);
 
   const client = new ImapFlow({
     host, port, secure,
     auth: { user, pass },
     logger: false,
-    // Make timeouts sane, and disable background keepalive so no late events fire
-    socketTimeout: numEnv('IMAP_SOCKET_TIMEOUT_MS', 120000),
-    greetingTimeout: numEnv('IMAP_CONN_TIMEOUT_MS', 30000),
-    authTimeout: numEnv('IMAP_AUTH_TIMEOUT_MS', 30000),
-    tls: { servername: env('IMAP_TLS_SERVERNAME', host), minVersion: 'TLSv1.2' },
-    keepalive: false,
+    socketTimeout: numEnv('IMAP_SOCKET_TIMEOUT_MS', 30000),
+    greetingTimeout: numEnv('IMAP_CONN_TIMEOUT_MS', 15000),
+    authTimeout: numEnv('IMAP_AUTH_TIMEOUT_MS', 15000),
+    tls: { servername: env('IMAP_TLS_SERVERNAME', host), minVersion: 'TLSv1.2' }
   });
 
-  const onErr = (e) => {
-    // swallow late socket/NOOP timeouts after we’re already done
-    if (debug) console.warn('[IMAP error]', e?.code || '', e?.message || e);
+  client.on('error', e => console.warn('[IMAP error]', e?.message || e));
+
+  // robust extractor: custom regex → spaced/hyphen → raw source (qp unwrapped)
+  const extractCode = (subject, text, html, rawBuf) => {
+    const stripHtml = s => String(s || '')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;/gi, ' ')
+      .replace(/&amp;/gi, '&')
+      .replace(/&lt;/gi, '<')
+      .replace(/&gt;/gi, '>');
+    const rawStr = rawBuf ? rawBuf.toString('utf8') : '';
+
+    const qpUnwrap = rawStr.replace(/=\r?\n/g, ''); // quoted-printable soft breaks
+
+    const haystack = [
+      subject || '',
+      text || '',
+      stripHtml(html || ''),
+      qpUnwrap
+    ].join('  ').replace(/[\u200B-\u200D\uFEFF]/g, '');
+
+    // 1) user regex
+    try {
+      const rx = new RegExp(codeRxStr, 'g');
+      const m = haystack.match(rx);
+      if (m && m[0]) return m[0];
+    } catch {}
+
+    // 2) 6 digits with spaces/hyphens in between (handles templated spans fairly well once HTML is stripped)
+    const m2 = haystack.match(/(?<!\d)(?:\d[\s-]*){6}(?!\d)/);
+    if (m2 && m2[0]) {
+      const only = m2[0].replace(/[^\d]/g, '');
+      if (only.length === 6) return only;
+    }
+    return null;
   };
-  client.on('error', onErr);
 
-  const sinceDate = new Date(Date.now() - lookbackMin * 60 * 1000);
+  const processBox = async (box) => {
+    log('open', box);
+    const boxInfo = await client.mailboxOpen(box);
 
-  const extractFromSubject = (subject) => {
-    if (!subject) return null;
-    const m = subject.match(codeRegex);
-    return m && m[0] ? m[0] : null;
-  };
-
-  const extractFromParsed = (parsed) => {
-    if (!parsed) return null;
-    const hay = [
-      parsed.subject || '',
-      parsed.text || '',
-      String(parsed.html || '').replace(/<[^>]+>/g, ' ')
-    ].join('\n');
-    const m = hay.match(codeRegex);
-    return m && m[0] ? m[0] : null;
-  };
-
-  const searchLatest = async (boxName) => {
-    log('open', boxName);
-    await client.mailboxOpen(boxName);
-
-    const qBase = { since: sinceDate };
-    if (fromFilter) qBase.from = fromFilter;
-    if (subjectFilter) qBase.subject = subjectFilter;
-    if (onlyUnseen) qBase.seen = false;
-
-    // Try strict first, then loosen
-    const queries = [qBase];
-    if (onlyUnseen) queries.push({ ...qBase, seen: undefined });
-    if (subjectFilter) queries.push({ since: sinceDate, subject: subjectFilter });
-    queries.push({ since: sinceDate });
+    // Primary search (fast): subject/from/seen + since
+    const q = { since };
+    if (fromFilter)   q.from    = fromFilter;
+    if (subjectFilt)  q.subject = subjectFilt;
+    if (onlyUnseen)   q.seen    = false;
 
     let uids = [];
-    for (const q of queries) {
+    try {
+      uids = await client.search(q);
+      log('search', q, '->', uids.length);
+    } catch (e) {
+      log('search error:', e?.message || e);
+    }
+
+    // Fallback A: if none, relax search (subject only)
+    if (!uids.length && subjectFilt) {
       try {
-        const found = await client.search(q);
-        log('search', q, '->', found.length);
-        if (found.length) { uids = found; break; }
-      } catch (e) {
-        log('search error:', e?.message || e);
+        uids = await client.search({ subject: subjectFilt });
+        log('fallback subject-only ->', uids.length);
+      } catch {}
+    }
+
+    // Fallback B: if still none, scan last N UIDs via UIDNEXT
+    if (!uids.length) {
+      const startUid = Math.max(1, (boxInfo.uidNext || 1) - 1);
+      const tailUids = [];
+      for (let u = startUid; u > 0 && tailUids.length < uidFudge; u--) {
+        tailUids.push(u);
+      }
+      uids = tailUids;
+      log('fallback UIDNEXT tail ->', uids.length);
+    }
+
+    // newest first
+    const uniq = Array.from(new Set(uids)).sort((a,b)=>b-a);
+
+    for (const uid of uniq) {
+      const m = await client.fetchOne(uid, {
+        uid: true, internalDate: true, envelope: true, flags: true, source: true
+      }).catch(() => null);
+      if (!m) continue;
+
+      // honor onlyUnseen if requested
+      if (onlyUnseen && Array.isArray(m.flags) && m.flags.includes('\\Seen')) continue;
+
+      // time gate (internalDate >= since - skew)
+      if (m.internalDate) {
+        const idMs = new Date(m.internalDate).getTime();
+        if (Number.isFinite(idMs) && idMs < (since.getTime() - timeSkewMs)) continue;
+      }
+
+      const subj = m.envelope?.subject || '';
+      let parsed = null;
+      try { parsed = await simpleParser(m.source); } catch {}
+      const code = extractCode(
+        parsed?.subject ?? subj,
+        parsed?.text,
+        parsed?.html,
+        m.source
+      );
+      if (code) {
+        console.log('[IMAP] ✅ 2FA code found.');
+        return code;
       }
     }
-    if (!uids.length) return null;
-
-    // newest first; look at a small tail
-    uids.sort((a,b)=>b-a);
-    const sample = uids.slice(0, 10);
-
-    // 1) subject pass
-    for (const uid of sample) {
-      const envlp = await client.fetchOne(uid, { envelope: true, headers: true }).catch(()=>null);
-      const subject = envlp?.envelope?.subject || envlp?.headers?.get('subject') || '';
-      const code = extractFromSubject(subject);
-      if (code) return code;
-    }
-
-    // 2) body pass
-    for (const uid of sample) {
-      const msg = await client.fetchOne(uid, { source: true, envelope: true }).catch(()=>null);
-      if (!msg?.source) continue;
-      const parsed = await simpleParser(msg.source).catch(()=>null);
-      const code = extractFromParsed(parsed);
-      if (code) return code;
-    }
-
     return null;
   };
 
   try {
     await client.connect();
-    let code = await searchLatest(mailbox);
-    if (!code && altMailbox) code = await searchLatest(altMailbox);
-    return code || null;
+    for (const box of mailboxes) {
+      const code = await processBox(box);
+      if (code) return code;
+    }
+    throw new Error('2FA code not found via IMAP');
   } finally {
-    // Close mailbox and session, and detach error handler to avoid late events
-    try { await client.mailboxClose().catch(()=>{}); } catch {}
     try { await client.logout(); } catch {}
-    try { client.removeListener('error', onErr); } catch {}
   }
 }
 // ===== Portal Actions ========================================================
