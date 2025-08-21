@@ -1512,18 +1512,25 @@ function parseBody(req) {
   });
 }
 
+// ===== Idle Trigger Server (no env overrides, no GET run) ====================
+let RUNNING = false;
+let LAST_RUN = null;
+let LAST_ERR = null;
+
+function json(res, code, payload) {
+  res.writeHead(code, { 'content-type': 'application/json' });
+  res.end(JSON.stringify(payload));
+}
+
 function startTriggerServer() {
-  const port = numEnv('JOB_PORT', 3999);
-  const requiredKey = env('JOB_API_KEY', '');
-  // make allowGet available everywhere in this function
-  const allowGet = /^(1|true|yes|on)$/i.test(String(process.env.ALLOW_GET_RUN || ''));
+  const port = Number(process.env.JOB_PORT) || 3999;
+  const requiredKey = process.env.JOB_API_KEY || '';
 
   const server = http.createServer(async (req, res) => {
-    // Normalize path: strip query + trailing slashes
-    const rawPath = (req.url || '/');
+    // Normalize path and method
+    const rawPath = req.url || '/';
     const pathOnly = rawPath.split('?')[0].replace(/\/+$/, '') || '/';
     const method = req.method || 'GET';
-
     console.log(`[idle] ${method} ${rawPath} → ${pathOnly}`);
 
     // Health
@@ -1531,8 +1538,8 @@ function startTriggerServer() {
       return json(res, 200, { ok: true, running: RUNNING, lastRun: LAST_RUN, lastErr: LAST_ERR });
     }
 
-    // Run (accept POST; optionally GET if ALLOW_GET_RUN=1)
-    if ((method === 'POST' || (allowGet && method === 'GET')) && pathOnly === '/run') {
+    // Run (POST only; no env patching)
+    if (method === 'POST' && pathOnly === '/run') {
       const key = req.headers['x-api-key'] || '';
       if (requiredKey && key !== requiredKey) {
         console.warn('[idle] unauthorized /run attempt');
@@ -1540,19 +1547,17 @@ function startTriggerServer() {
       }
       if (RUNNING) return json(res, 409, { error: 'already running' });
 
-      const overrides = method === 'POST' ? await parseBody(req) : {};
       RUNNING = true;
       LAST_ERR = null;
+      const startedAt = new Date().toISOString();
+
       try {
-        const startedAt = new Date().toISOString();
-        await withEnv(overrides, async () => {
-          await runNetAchOnce();
-        });
+        await runNetAchOnce(); // ← your job function, no args, no env edits
         LAST_RUN = { ok: true, startedAt, finishedAt: new Date().toISOString() };
         return json(res, 200, { ok: true, message: 'run completed' });
       } catch (e) {
         LAST_ERR = String(e?.message || e);
-        LAST_RUN = { ok: false, finishedAt: new Date().toISOString() };
+        LAST_RUN = { ok: false, startedAt, finishedAt: new Date().toISOString() };
         return json(res, 500, { ok: false, error: LAST_ERR });
       } finally {
         RUNNING = false;
@@ -1560,14 +1565,13 @@ function startTriggerServer() {
     }
 
     // Not found
-    json(res, 404, { error: 'not found', path: pathOnly, method });
+    return json(res, 404, { error: 'not found', path: pathOnly, method });
   });
 
   server.listen(port, () => {
     console.log(`[idle] Trigger server listening on :${port}`);
     console.log(`[idle] POST /run (with header x-api-key) to execute a run`);
     console.log(`[idle] GET  /health or /status for liveness`);
-    if (allowGet) console.log(`[idle] GET /run enabled (ALLOW_GET_RUN=1)`);
   });
 
   return server;
