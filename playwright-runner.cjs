@@ -311,21 +311,6 @@ async function clickLoadReport(page) {
   }
   throw lastErr || new Error('Failed to click "Load report" after retries');
 }
-// Single function: get2faCodeSince(anchorMs)
-//
-// Usage:
-//   const anchor = Date.now();           // right after you see the 2FA screen
-//   const code = await get2faCodeSince(anchor);
-//   if (!code) throw new Error('2FA email not found in time');
-//   await submitTwofaCode(page, code);
-
-async function waitFor2faCode() {
-  console.log('[2FA] Waiting for newest unread code via IMAP…');
-  const code = await get2faCodeFromImap();
-  if (!code) throw new Error('2FA code not found via IMAP');
-  console.log('[2FA] Got code.');
-  return code;
-}
 
 
 
