@@ -1490,3 +1490,57 @@ if (require.main === module) {
 }
 module.exports = { runNetAchOnce };
 
+function startTriggerServer() {
+  const port = Number(process.env.JOB_PORT) || 3999;
+  const requiredKey = process.env.JOB_API_KEY || '';
+
+  // global singleton avoids redeclare errors
+  const state = (globalThis.__TRIGGER_STATE__ ||= {
+    running: false,
+    lastRun: null,
+    lastErr: null,
+  });
+
+  const server = http.createServer(async (req, res) => {
+    const rawPath = req.url || '/';
+    const pathOnly = rawPath.split('?')[0].replace(/\/+$/, '') || '/';
+    const method = req.method || 'GET';
+    console.log(`[idle] ${method} ${rawPath} → ${pathOnly}`);
+
+    if (method === 'GET' && (pathOnly === '/health' || pathOnly === '/status')) {
+      return json(res, 200, { ok: true, running: state.running, lastRun: state.lastRun, lastErr: state.lastErr });
+    }
+
+    if (method === 'POST' && pathOnly === '/run') {
+      const key = req.headers['x-api-key'] || '';
+      if (requiredKey && key !== requiredKey) return json(res, 401, { error: 'unauthorized' });
+      if (state.running) return json(res, 409, { error: 'already running' });
+
+      state.running = true;
+      state.lastErr = null;
+      const startedAt = new Date().toISOString();
+
+      try {
+        await runNetAchOnce(); // no env overrides
+        state.lastRun = { ok: true, startedAt, finishedAt: new Date().toISOString() };
+        return json(res, 200, { ok: true, message: 'run completed' });
+      } catch (e) {
+        state.lastErr = String(e?.message || e);
+        state.lastRun = { ok: false, startedAt, finishedAt: new Date().toISOString() };
+        return json(res, 500, { ok: false, error: state.lastErr });
+      } finally {
+        state.running = false;
+      }
+    }
+
+    return json(res, 404, { error: 'not found', path: pathOnly, method });
+  });
+
+  server.listen(port, () => {
+    console.log(`[idle] Trigger server listening on :${port}`);
+    console.log(`[idle] POST /run (with header x-api-key) to execute a run`);
+    console.log(`[idle] GET  /health or /status for liveness`);
+  });
+
+  return server;
+}
