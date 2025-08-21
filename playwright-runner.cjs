@@ -307,294 +307,170 @@ async function clickLoadReport(page) {
   }
   throw lastErr || new Error('Failed to click "Load report" after retries');
 }
-// ===== IMAP 2FA Helper =======================================================
-async function waitFor2faCode() {
-  console.log('Waiting for newest unread 2FA email via IMAP…');
-  const code = await get2faCodeFromImap();
-  console.log('Got 2FA code.');
-  return code;
-}
-// ===== IMAP 2FA Helper (patched) ============================================
-// ===== IMAP 2FA Helper (final) ==============================================
-// Robust to container/local time skew; HTML-aware code extraction.
+// Single function: get2faCodeSince(anchorMs)
 //
-// ENV (optional):
-//   IMAP_HOST, IMAP_PORT=993, IMAP_SECURE=true, IMAP_USER, IMAP_PASS
-//   IMAP_MAILBOXES="INBOX,[Gmail]/All Mail,[Gmail]/Spam"
-//   IMAP_LOOKBACK_MIN=300        IMAP_WINDOW_FUDGE_MIN=15
-//   IMAP_MAX_SCAN=60             IMAP_FROM_FILTER=""         // regex (optional)
-//   IMAP_SUBJECT_FILTER="Elevate MFA Code"                   // regex (optional)
-//   IMAP_CODE_LEN=6              IMAP_DEBUG=true
-//   LOCAL_TZ="America/Boise"     IMAP_USE_GMAIL_RAW=true
-//
-// NOTE: Do not rely on "unread". We use INTERNALDATE + windows instead.
-
-function fmtTZ(date, tz) {
-  try {
-    return new Intl.DateTimeFormat('en-US', {
-      timeZone: tz,
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-      hour12: true,
-    }).format(date);
-  } catch {
-    return '(tz format unavailable)';
-  }
-}
-function maskUser(u) {
-  if (!u) return '';
-  const [n, h] = String(u).split('@');
-  return `${(n || '').slice(0, 2)}***@${h || ''}`;
-}
-function stripHtml(html) {
-  if (!html) return '';
-  return String(html)
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&amp;/gi, '&')
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/<[^>]+>/g, ' ');
-}
-function normalizeDigits(s) {
-  if (!s) return '';
-  return String(s)
-    .replace(/[\u200B-\u200D\uFEFF]/g, '') // zero-width
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-function findCode(haystack, codeLen) {
-  // Accept digits separated by spaces/hyphens: (?<!\d)(?:\d[\s-]*){N}(?!\d)
-  const pattern = new RegExp(`(?<!\\d)(?:\\d[\\s-]*){${codeLen}}(?!\\d)`, 'g');
-  const text = normalizeDigits(haystack);
-  let m;
-  while ((m = pattern.exec(text))) {
-    const onlyDigits = m[0].replace(/[^\d]/g, '');
-    if (onlyDigits.length === codeLen) return onlyDigits;
-  }
-  return null;
-}
+// Usage:
+//   const anchor = Date.now();           // right after you see the 2FA screen
+//   const code = await get2faCodeSince(anchor);
+//   if (!code) throw new Error('2FA email not found in time');
+//   await submitTwofaCode(page, code);
 
 async function waitFor2faCode() {
-  console.log('[2FA] Waiting for newest 2FA email via IMAP…');
+  console.log('[2FA] Waiting for newest unread code via IMAP…');
   const code = await get2faCodeFromImap();
-  if (typeof code === 'string' && code) {
-    console.log('[2FA] Got 2FA code.');
-  } else {
-    console.log('[2FA] No 2FA code found within window.');
-  }
+  if (!code) throw new Error('2FA code not found via IMAP');
+  console.log('[2FA] Got code.');
   return code;
 }
-// ANCHOR: get2fa start
-async function get2faCodeFromImap(opts = {}) {
+
+
+
+// STRICT: only take mail that arrived after `anchorMs` (±15s slack), using UIDNEXT.
+// Uses ONLY your existing env vars: IMAP_* listed in your .env (no new ones).
+// ===== IMAP 2FA Helper (bulletproof) =========================================
+async function waitFor2faCode() {
+  const code = await get2faCodeFromImap();
+  if (!code) throw new Error('2FA code not found via IMAP');
+  return code;
+}
+
+async function get2faCodeFromImap() {
   const debug = /^(1|true|yes|on)$/i.test(String(process.env.IMAP_DEBUG || ''));
   const log = (...a) => debug && console.log('[IMAP]', ...a);
 
-  const host = env('IMAP_HOST', 'imap.gmail.com');
-  const port = numEnv('IMAP_PORT', 993);
-  const secure = bool(env('IMAP_SECURE', 'true'), true);
-  const user = opts.user ?? env('IMAP_USER');
-  const pass = opts.pass ?? env('IMAP_PASS');
-  if (!user || !pass) throw new Error('IMAP_USER/IMAP_PASS missing');
+  const host           = env('IMAP_HOST', 'imap.gmail.com');
+  const port           = numEnv('IMAP_PORT', 993);
+  const secure         = bool(env('IMAP_SECURE'), true);
+  const user           = env('IMAP_USER');
+  const pass           = env('IMAP_PASS');
+  const mailbox        = env('IMAP_MAILBOX', 'INBOX');
+  const altMailbox     = env('IMAP_ALT_MAILBOX', '');
+  const fromFilter     = (env('IMAP_FROM_FILTER', '') || '').trim();
+  const subjectFilter  = (env('IMAP_SUBJECT_FILTER', 'Elevate MFA Code') || '').trim();
+  const lookbackMin    = numEnv('IMAP_LOOKBACK_MINUTES', 60);
+  const onlyUnseen     = bool(env('IMAP_ONLY_UNSEEN', 'true'));
+  const codeRegex      = new RegExp(env('IMAP_CODE_REGEX', '(?<!\\d)\\d{6}(?!\\d)'), 'g');
 
-  const mailboxCsv = env(
-    'IMAP_MAILBOXES',
-    'INBOX,[Gmail]/All Mail,[Gmail]/Spam'
-  );
-  const mailboxes = mailboxCsv
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
-  const fromFilter = (env('IMAP_FROM_FILTER', '') || '').trim(); // optional regex
-  const subjFilter = (
-    env('IMAP_SUBJECT_FILTER', 'Elevate MFA Code') || ''
-  ).trim(); // optional regex
-  const lookbackMin = numEnv('IMAP_LOOKBACK_MIN', 300);
-  const fudgeMin = numEnv('IMAP_WINDOW_FUDGE_MIN', 15);
-  const maxScan = numEnv('IMAP_MAX_SCAN', 60);
-  const codeLen = Math.max(4, Math.min(8, numEnv('IMAP_CODE_LEN', 6)));
-
-  const localTZ = env('LOCAL_TZ', 'America/Boise');
-  const now = new Date();
-  const cutoffMs = now.getTime() - (lookbackMin + fudgeMin) * 60 * 1000;
-
-  const hostIsGmail = /gmail|googlemail/i.test(host);
-  const useGmailRaw = /^(1|true|yes|on)$/i.test(
-    String(process.env.IMAP_USE_GMAIL_RAW ?? (hostIsGmail ? 'true' : 'false'))
-  );
-
-  log('connect', { host, port, secure, user: maskUser(user) });
-  log(
-    'time.utc',
-    now.toISOString(),
-    'time.local',
-    fmtTZ(now, localTZ),
-    'tzOffsetMin',
-    new Date().getTimezoneOffset()
-  );
-  log('search.setup', {
-    mailboxes,
-    lookbackMin,
-    fudgeMin,
-    maxScan,
-    fromFilter,
-    subjFilter,
-    codeLen,
-    useGmailRaw,
+  const client = new ImapFlow({
+    host, port, secure,
+    auth: { user, pass },
+    logger: false,
+    // Make timeouts sane, and disable background keepalive so no late events fire
+    socketTimeout: numEnv('IMAP_SOCKET_TIMEOUT_MS', 120000),
+    greetingTimeout: numEnv('IMAP_CONN_TIMEOUT_MS', 30000),
+    authTimeout: numEnv('IMAP_AUTH_TIMEOUT_MS', 30000),
+    tls: { servername: env('IMAP_TLS_SERVERNAME', host), minVersion: 'TLSv1.2' },
+    keepalive: false,
   });
 
-  const client = new ImapFlow({ host, port, secure, auth: { user, pass } });
+  const onErr = (e) => {
+    // swallow late socket/NOOP timeouts after we’re already done
+    if (debug) console.warn('[IMAP error]', e?.code || '', e?.message || e);
+  };
+  client.on('error', onErr);
 
-  const scanMailbox = async (mbox) => {
-    const lock = await client.getMailboxLock(mbox);
-    try {
-      let uids = [];
-      if (useGmailRaw) {
-        // precise window, independent of TZ
-        const terms = [`newer_than:${lookbackMin + fudgeMin}m`];
-        if (subjFilter)
-          terms.push(`subject:"${subjFilter.replace(/"/g, '\\"')}"`);
-        if (fromFilter) terms.push(`from:"${fromFilter.replace(/"/g, '\\"')}"`);
-        const gmailRaw = terms.join(' ');
-        log('X-GM-RAW', { mbox, gmailRaw });
-        uids = await client.search({ gmailRaw }, { uid: true });
-      } else {
-        const sinceDate = new Date(cutoffMs);
-        uids = await client.search({ since: sinceDate }, { uid: true });
-        if (!uids.length) {
-          // cross midnight if needed
-          const widened = new Date(cutoffMs - 24 * 60 * 60 * 1000);
-          log('since.widened', { mbox, widened: widened.toISOString() });
-          uids = await client.search({ since: widened }, { uid: true });
-        }
+  const sinceDate = new Date(Date.now() - lookbackMin * 60 * 1000);
+
+  const extractFromSubject = (subject) => {
+    if (!subject) return null;
+    const m = subject.match(codeRegex);
+    return m && m[0] ? m[0] : null;
+  };
+
+  const extractFromParsed = (parsed) => {
+    if (!parsed) return null;
+    const hay = [
+      parsed.subject || '',
+      parsed.text || '',
+      String(parsed.html || '').replace(/<[^>]+>/g, ' ')
+    ].join('\n');
+    const m = hay.match(codeRegex);
+    return m && m[0] ? m[0] : null;
+  };
+
+  const searchLatest = async (boxName) => {
+    log('open', boxName);
+    await client.mailboxOpen(boxName);
+
+    const qBase = { since: sinceDate };
+    if (fromFilter) qBase.from = fromFilter;
+    if (subjectFilter) qBase.subject = subjectFilter;
+    if (onlyUnseen) qBase.seen = false;
+
+    // Try strict first, then loosen
+    const queries = [qBase];
+    if (onlyUnseen) queries.push({ ...qBase, seen: undefined });
+    if (subjectFilter) queries.push({ since: sinceDate, subject: subjectFilter });
+    queries.push({ since: sinceDate });
+
+    let uids = [];
+    for (const q of queries) {
+      try {
+        const found = await client.search(q);
+        log('search', q, '->', found.length);
+        if (found.length) { uids = found; break; }
+      } catch (e) {
+        log('search error:', e?.message || e);
       }
-      log('uids', { mbox, count: uids.length });
-      if (!uids.length) return null;
-
-      // newest first, capped
-      const scan = uids.slice(-maxScan).reverse();
-
-      for (const uid of scan) {
-        const msg = await client.fetchOne(uid, {
-          uid: true,
-          envelope: true,
-          internalDate: true,
-          source: true,
-        });
-        if (!msg) continue;
-
-        const idate = msg.internalDate ? new Date(msg.internalDate) : null;
-        if (idate && idate.getTime() < cutoffMs) {
-          log('skip.old', { mbox, uid, idate: idate.toISOString() });
-          continue;
-        }
-
-        // Parse and build haystacks
-        let parsed;
-        try {
-          parsed = await simpleParser(msg.source);
-        } catch (e) {
-          log('parse.fail', { mbox, uid, err: e?.message || String(e) });
-          continue;
-        }
-
-        const subj = parsed.subject || '';
-        const from = (parsed.from?.value || [])
-          .map((v) => v.address || '')
-          .join(', ');
-
-        if (subjFilter && !new RegExp(subjFilter, 'i').test(subj)) {
-          log('skip.subj', { mbox, uid, subj: subj.slice(0, 160) });
-          continue;
-        }
-        if (fromFilter && !new RegExp(fromFilter, 'i').test(from)) {
-          log('skip.from', { mbox, uid, from });
-          continue;
-        }
-
-        const hayText = parsed.text || '';
-        const hayHtml = stripHtml(parsed.html || '');
-        const haySubject = subj;
-
-        // Try text → HTML → subject
-        let code =
-          findCode(hayText, codeLen) ||
-          findCode(hayHtml, codeLen) ||
-          findCode(haySubject, codeLen);
-
-        // Last-resort: search raw source quickly (covers odd encodings)
-        if (!code && msg.source) {
-          try {
-            const raw = msg.source.toString('utf8');
-            code = findCode(raw, codeLen);
-          } catch {}
-        }
-
-        log('inspect', {
-          mbox,
-          uid,
-          idate: idate ? idate.toISOString() : null,
-          subj: haySubject.slice(0, 160),
-          from,
-          found: !!code,
-          src: code
-            ? findCode(hayText, codeLen)
-              ? 'text'
-              : findCode(hayHtml, codeLen)
-              ? 'html'
-              : 'subject/raw'
-            : 'n/a',
-          codeHint: code ? `${code.slice(0, 2)}****` : null,
-        });
-
-        if (code) return code;
-      }
-      return null;
-    } finally {
-      lock.release();
     }
+    if (!uids.length) return null;
+
+    // newest first; look at a small tail
+    uids.sort((a,b)=>b-a);
+    const sample = uids.slice(0, 10);
+
+    // 1) subject pass
+    for (const uid of sample) {
+      const envlp = await client.fetchOne(uid, { envelope: true, headers: true }).catch(()=>null);
+      const subject = envlp?.envelope?.subject || envlp?.headers?.get('subject') || '';
+      const code = extractFromSubject(subject);
+      if (code) return code;
+    }
+
+    // 2) body pass
+    for (const uid of sample) {
+      const msg = await client.fetchOne(uid, { source: true, envelope: true }).catch(()=>null);
+      if (!msg?.source) continue;
+      const parsed = await simpleParser(msg.source).catch(()=>null);
+      const code = extractFromParsed(parsed);
+      if (code) return code;
+    }
+
+    return null;
   };
 
   try {
     await client.connect();
-    for (const mbox of mailboxes) {
-      const code = await scanMailbox(mbox);
-      if (code) {
-        console.log('[IMAP] ✅ 2FA code found.');
-        return String(code);
-      }
-    }
-    console.warn(
-      '[IMAP] Searched but did not find a matching 2FA code within window.'
-    );
-    return null;
-  } catch (err) {
-    console.error('[IMAP] error:', err?.message || err);
-    throw err;
+    let code = await searchLatest(mailbox);
+    if (!code && altMailbox) code = await searchLatest(altMailbox);
+    return code || null;
   } finally {
-    try {
-      await client.logout();
-    } catch {}
+    // Close mailbox and session, and detach error handler to avoid late events
+    try { await client.mailboxClose().catch(()=>{}); } catch {}
+    try { await client.logout(); } catch {}
+    try { client.removeListener('error', onErr); } catch {}
   }
 }
-
-// ANCHOR: get2fa:end
-
 // ===== Portal Actions ========================================================
 async function login(page) {
   const base = env('ELEVATE_BASE', 'https://portal.elevateqs.com');
-  const navState = env('LOAD_STATE', 'domcontentloaded');
+  const navState = env('LOAD_STATE', 'networkidle'); // may be networkidle or domcontentloaded
   const navTimeout = numEnv('NAV_TIMEOUT_MS', 15000);
 
-  await page.goto(base, { waitUntil: navState }).catch(() => {});
+  console.log('[login] goto base:', base, 'waitUntil=', navState);
+  try {
+    await page.goto(base, { waitUntil: navState, timeout: navTimeout });
+  } catch (e) {
+    console.warn('[login] base goto timed out with', navState, '— retrying with domcontentloaded');
+    try {
+      await page.goto(base, { waitUntil: 'domcontentloaded', timeout: navTimeout });
+    } catch (e2) {
+      console.warn('[login] fallback domcontentloaded also failed:', e2.message);
+    }
+  }
+  console.log('[login] after base goto URL:', page.url());
 
-  const loginPaths = env(
-    'LOGIN_PATHS',
-    '/Account/Login,/login,/Login.aspx,/Account/LogOn,/Account/SignIn'
-  )
+  const loginPaths = env('LOGIN_PATHS', '/Account/Login,/login,/Login.aspx,/Account/LogOn,/Account/SignIn')
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
@@ -602,39 +478,34 @@ async function login(page) {
   if (!/login/i.test(page.url())) {
     for (const suffix of loginPaths) {
       const u = base.replace(/\/$/, '') + suffix;
+      console.log('[login] try goto', u);
       try {
-        await page.goto(u, { waitUntil: navState, timeout: navTimeout });
+        await page.goto(u, { waitUntil: 'domcontentloaded', timeout: navTimeout });
         const title = await page.title().catch(() => '');
-        if (/login|signin|account/i.test(title) || /login/i.test(page.url()))
-          break;
-      } catch {}
+        console.log('[login] at', page.url(), 'title=', title);
+        if (/login|signin|account/i.test(title) || /login/i.test(page.url())) break;
+      } catch (e) {
+        console.warn('[login] path goto failed:', u, e.message);
+      }
     }
   }
 
   const sel = SELECTORS.login;
   const username = env('ELEVATE_USERNAME');
   const password = env('ELEVATE_PASSWORD');
-  if (!username || !password)
-    throw new Error('Missing ELEVATE_USERNAME or ELEVATE_PASSWORD in .env');
+  if (!username || !password) throw new Error('Missing ELEVATE_USERNAME or ELEVATE_PASSWORD in .env');
 
-  await page.waitForTimeout(300);
-  await page
-    .locator(sel.username)
-    .first()
-    .fill(username, { timeout: navTimeout });
-  await page
-    .locator(sel.password)
-    .first()
-    .fill(password, { timeout: navTimeout });
+  console.log('[login] filling creds…');
+  await page.locator(sel.username).first().fill(username, { timeout: navTimeout });
+  await page.locator(sel.password).first().fill(password, { timeout: navTimeout });
 
+  console.log('[login] submitting…');
   await Promise.all([
-    page
-      .waitForNavigation({ waitUntil: navState, timeout: navTimeout })
-      .catch(() => {}),
+    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: navTimeout }).catch(() => {}),
     page.locator(sel.submit).first().click({ timeout: navTimeout }),
   ]);
+  console.log('[login] submit done. URL:', page.url());
 }
-
 async function loginWithRetries(page) {
   const attempts = numEnv('LOGIN_RETRIES', 3);
   const backoff = numEnv('LOGIN_BACKOFF_MS', 2000);
@@ -1360,6 +1231,9 @@ async function countSelectedMids(page) {
 
 // ANCHOR: main
 // ===== Main ==================================================================
+// ===== Main ==================================================================
+// ===== Main ==================================================================
+// ===== Main ==================================================================
 async function main() {
   console.log('▶️  Playwright Runner starting');
   console.log(`Node: ${process.version} (${process.platform} ${process.arch})`);
@@ -1369,10 +1243,10 @@ async function main() {
   const runningInDocker = fs.existsSync('/.dockerenv');
   const hasDisplay = !!process.env.DISPLAY;
 
-  // Compute one authoritative headless flag
+  // One authoritative headless flag
   const effectiveHeadless =
     process.env.HEADLESS != null && process.env.HEADLESS !== ''
-      ? /^(true|1|yes|on)$/i.test(process.env.HEADLESS)
+      ? /^(true|1|yes|on)$/i.test(String(process.env.HEADLESS))
       : runningInDocker || !hasDisplay;
 
   console.log('Config:', {
@@ -1383,6 +1257,7 @@ async function main() {
     LOAD_STATE: env('LOAD_STATE', 'networkidle'),
   });
 
+  // Dates & output folders
   const { start, end } = getDateRange();
   const dayFolderName = new Intl.DateTimeFormat('en-CA', {
     timeZone: DATE_TZ,
@@ -1394,7 +1269,7 @@ async function main() {
   fs.mkdirSync(dayDir, { recursive: true });
   fs.mkdirSync(ERROR_SHOTS, { recursive: true });
 
-  // Load MIDs
+  // Merchants
   const merchants = loadMerchants();
   const mids = merchants.map((m) => m.id);
   if (!mids.length) {
@@ -1402,34 +1277,19 @@ async function main() {
     process.exit(1);
   }
 
-  // Run summary scaffold
+  // Summary scaffold
   const summary = {
     date: dayFolderName,
     timezone: DATE_TZ,
     portal: env('ELEVATE_BASE', 'https://portal.elevateqs.com'),
     range: { start: formatDateForPortal(start), end: formatDateForPortal(end) },
-    totals: {
-      requested: merchants.length,
-      succeeded: 0,
-      failed: 0,
-      files: 0,
-      unique_files: 0,
-    },
-    merchants: merchants.map((m) => ({
-      id: m.id,
-      name: m.name,
-      status: 'pending',
-      files: [],
-      error: null,
-    })),
+    totals: { requested: merchants.length, succeeded: 0, failed: 0, files: 0, unique_files: 0 },
+    merchants: merchants.map((m) => ({ id: m.id, name: m.name, status: 'pending', files: [], error: null })),
     artifacts: { folder: dayDir, screenshots: ERROR_SHOTS },
   };
   const summarize = () => {
     const ok = summary.merchants.filter((m) => m.status === 'ok').length;
-    const files = summary.merchants.reduce(
-      (n, m) => n + (m.files ? m.files.length : 0),
-      0
-    );
+    const files = summary.merchants.reduce((n, m) => n + (m.files ? m.files.length : 0), 0);
     const uf = new Set();
     summary.merchants.forEach((m) => (m.files || []).forEach((f) => uf.add(f)));
     summary.totals.succeeded = ok;
@@ -1439,109 +1299,106 @@ async function main() {
   };
 
   // Browser
+  console.log('[main] launching Chromium…');
   const browser = await chromium.launch({
     headless: effectiveHeadless,
     slowMo: Number(process.env.SLOWMO_MS ?? 0) || 0,
     args: ['--no-sandbox', '--disable-setuid-sandbox'],
   });
+  console.log('[main] Chromium launched');
 
   const context = await browser.newContext({ acceptDownloads: true });
   const page = await context.newPage();
   page.setDefaultTimeout(numEnv('NAV_TIMEOUT_MS', 15000));
+  page.setDefaultNavigationTimeout(numEnv('NAV_TIMEOUT_MS', 15000));
+  console.log('[main] Page created; starting login…');
 
   try {
     // --- Login (+retries) ---
     await loginWithRetries(page);
+    console.log('[main] login complete. URL:', page.url());
 
     // --- 2FA (IMAP) if present ---
-    try {
-      await page.waitForTimeout(numEnv('MFA_READY_WAIT_MS', 1000));
-      if (await twofaScreenPresent(page)) {
-        const code = await waitFor2faCode();
-        if (!code || typeof code !== 'string') {
-          throw new Error(
-            '[2FA] No code captured; check IMAP_* filters or set IMAP_DEBUG=true for traces.'
-          );
-        }
-        await submitTwofaCode(page, code);
-        await page.waitForTimeout(numEnv('POST_2FA_PAUSE_MS', 800));
-        summary.mfa = {
-          via: 'imap',
-          from: env('IMAP_FROM_FILTER'),
-          subject: env('IMAP_SUBJECT_FILTER'),
-        };
-      }
-    } catch (e) {
-      console.warn('2FA step skipped or failed:', e.message);
-      summary.mfa = { error: e.message };
+  try {
+  await page.waitForTimeout(numEnv('MFA_READY_WAIT_MS', 1000));
+
+  const has2fa = await twofaScreenPresent(page);
+  if (!has2fa) {
+    console.log('[2FA] screen not detected; continuing.');
+  } else {
+    console.log('[2FA] screen detected — fetching code via IMAP…');
+
+    // Wait for a code (waitFor2faCode must throw if it can’t find one)
+    const code = await waitFor2faCode(); // <- uses your existing get2faCodeFromImap()
+    await submitTwofaCode(page, code);
+    await page.waitForTimeout(numEnv('POST_2FA_PAUSE_MS', 800));
+
+    // Verify we actually cleared the gate
+    if (await twofaScreenPresent(page)) {
+      throw new Error('2FA screen still visible after submitting code');
     }
 
-    // --- Navigate to Advanced Reporting -> Net ACH ---
-    if (SELECTORS.reporting?.advanced_link) {
-      await gotoAdvancedReporting(page);
-    }
+    summary.mfa = {
+      via: 'imap',
+      subject: env('IMAP_SUBJECT_FILTER', ''),
+      from: env('IMAP_FROM_FILTER', ''),
+    };
+    console.log('[2FA] done.');
+  }
+} catch (e) {
+  console.error('[2FA] failed:', e?.message || e);
+  summary.mfa = { error: e?.message || String(e) };
+  throw e; // hard-fail: do NOT continue to reporting if 2FA required and failed
+}
+
+    // --- Navigate to report ---
+    console.log('[nav] goto Advanced Reporting…');
+    if (SELECTORS.reporting?.advanced_link) await gotoAdvancedReporting(page);
+
+    console.log('[nav] goto Net ACH details…');
     await gotoNetAchDetails(page);
 
-    // --- Add all MIDs (with deliberate pauses) ---
+    // --- Add MIDs ---
+    console.log('[mids] adding', mids.length, 'MIDs…');
     await addMidsToAchReport(page, mids);
 
-    // Optional sanity check: all MIDs present as chips
-    if (
-      bool(env('REQUIRE_ALL_MIDS', 'true')) &&
-      SELECTORS.reporting?.mid_chip
-    ) {
+    if (bool(env('REQUIRE_ALL_MIDS', 'true')) && SELECTORS.reporting?.mid_chip) {
       const chipCount = await countSelectedMids(page);
       if (chipCount != null && chipCount < mids.length) {
-        throw new Error(
-          `Only ${chipCount} of ${mids.length} MIDs appear selected in the UI`
-        );
+        throw new Error(`Only ${chipCount} of ${mids.length} MIDs appear selected in the UI`);
       }
     }
 
     // --- Dates ---
-    if (SELECTORS.ach?.start_date)
-      await fillDateInput(
-        page,
-        SELECTORS.ach.start_date,
-        formatDateForPortal(start)
-      );
-    if (SELECTORS.ach?.end_date)
-      await fillDateInput(
-        page,
-        SELECTORS.ach.end_date,
-        formatDateForPortal(end)
-      );
+    console.log('[dates] setting range…');
+    if (SELECTORS.ach?.start_date) await fillDateInput(page, SELECTORS.ach.start_date, formatDateForPortal(start));
+    if (SELECTORS.ach?.end_date)   await fillDateInput(page, SELECTORS.ach.end_date,   formatDateForPortal(end));
 
-    // --- Run the report ---
+    // --- Run report ---
+    console.log('[report] click Load report…');
     await clickLoadReport(page);
 
-    // --- Single combined export (NOT per-merchant) ---
-    const bulkTag = `-${mids.length}-mids`;
+    // --- Export (combined) ---
+    console.log('[export] exporting combined file…');
+    const bulkTag  = `-${mids.length}-mids`;
     const bulkPath = await exportCurrentAch(page, dayDir, bulkTag);
 
-    // Mark success for every merchant, referencing the same file
     for (const m of summary.merchants) {
       m.status = 'ok';
       m.files = [bulkPath];
     }
 
-    // --- Email report ---
+    // --- Email report (best-effort) ---
     try {
       await emailReport(bulkPath, {
-        subject: env(
-          'EMAIL_SUBJECT',
-          `Net ACH Export ${summary.date} (${mids.length} MIDs)`
-        ),
-        text: env(
-          'EMAIL_BODY',
-          `Attached is the Net ACH export for ${summary.range.start} to ${summary.range.end}.`
-        ),
+        subject: env('EMAIL_SUBJECT', `Net ACH Export ${summary.date} (${mids.length} MIDs)`),
+        text:    env('EMAIL_BODY',   `Attached is the Net ACH export for ${summary.range.start} to ${summary.range.end}.`),
       });
     } catch (e) {
       console.warn('[EMAIL] send failed:', e?.message || e);
     }
   } finally {
-    // Write summary & teardown
+    // Summary & teardown
     summarize();
     const summaryName = env('SUMMARY_NAME', 'run-summary.json');
     const summaryPath = path.join(dayDir, summaryName);
@@ -1549,10 +1406,11 @@ async function main() {
       fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2), 'utf-8');
       console.log(`Summary written: ${summaryPath}`);
     } catch (e) {
-      console.error('Failed to write summary:', e.message);
+      console.error('Failed to write summary:', e?.message || e);
     }
     await context.close();
     await browser.close();
+    console.log('[main] done.');
   }
 }
 
@@ -1562,3 +1420,4 @@ if (require.main === module) {
     process.exit(1);
   });
 }
+
