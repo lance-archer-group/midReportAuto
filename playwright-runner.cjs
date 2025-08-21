@@ -1515,6 +1515,8 @@ function parseBody(req) {
 function startTriggerServer() {
   const port = numEnv('JOB_PORT', 3999);
   const requiredKey = env('JOB_API_KEY', '');
+  // make allowGet available everywhere in this function
+  const allowGet = /^(1|true|yes|on)$/i.test(String(process.env.ALLOW_GET_RUN || ''));
 
   const server = http.createServer(async (req, res) => {
     // Normalize path: strip query + trailing slashes
@@ -1522,7 +1524,6 @@ function startTriggerServer() {
     const pathOnly = rawPath.split('?')[0].replace(/\/+$/, '') || '/';
     const method = req.method || 'GET';
 
-    // Debug log so you can see exactly what hit you
     console.log(`[idle] ${method} ${rawPath} → ${pathOnly}`);
 
     // Health
@@ -1531,7 +1532,6 @@ function startTriggerServer() {
     }
 
     // Run (accept POST; optionally GET if ALLOW_GET_RUN=1)
-
     if ((method === 'POST' || (allowGet && method === 'GET')) && pathOnly === '/run') {
       const key = req.headers['x-api-key'] || '';
       if (requiredKey && key !== requiredKey) {
@@ -1539,7 +1539,7 @@ function startTriggerServer() {
         return json(res, 401, { error: 'unauthorized' });
       }
       if (RUNNING) return json(res, 409, { error: 'already running' });
-const allowGet = /^(1|true|yes|on)$/i.test(String(process.env.ALLOW_GET_RUN || ''));
+
       const overrides = method === 'POST' ? await parseBody(req) : {};
       RUNNING = true;
       LAST_ERR = null;
