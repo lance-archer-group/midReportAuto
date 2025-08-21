@@ -329,9 +329,25 @@ async function waitFor2faCode() {
 // Uses ONLY your existing env vars: IMAP_* listed in your .env (no new ones).
 // ===== IMAP 2FA Helper (bulletproof) =========================================
 async function waitFor2faCode() {
-  const code = await get2faCodeFromImap();
-  if (!code) throw new Error('2FA code not found via IMAP');
-  return code;
+  const maxWaitMs = numEnv('MFA_MAX_WAIT_MS', 90000); // default 90s
+  const pollMs    = numEnv('IMAP_POLL_MS', 3000);     // default 3s
+  const deadline  = Date.now() + maxWaitMs;
+
+  let attempt = 0;
+  while (Date.now() < deadline) {
+    attempt++;
+    try {
+      const code = await get2faCodeFromImap();
+      if (code) return code; // success
+    } catch (e) {
+      // log and keep trying
+      if (process.env.IMAP_DEBUG) {
+        console.warn('[IMAP] attempt', attempt, 'failed:', e?.message || e);
+      }
+    }
+    await new Promise(r => setTimeout(r, pollMs));
+  }
+  throw new Error('Timed out waiting for 2FA email');
 }
 
 async function get2faCodeFromImap() {
