@@ -14,4 +14,4 @@ ENV HEADLESS=true \
     SLOWMO_MS=0 \
     LOAD_STATE=networkidle
 
-CMD ["tail","-f","/dev/null"]
+CMD ["node", "playwright-runner.cjs"]
