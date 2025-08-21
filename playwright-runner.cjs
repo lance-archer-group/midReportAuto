@@ -1469,9 +1469,14 @@ async function main() {
 }
 
 if (require.main === module) {
-  main().catch((err) => {
-    console.error(err);
-    process.exit(1);
-  });
+  (async () => {
+    try {
+      await main();
+      // give stdout a moment to flush, then hard-exit
+      setTimeout(() => process.exit(0), Number(process.env.EXIT_FLUSH_MS || 200)).unref();
+    } catch (err) {
+      console.error(err);
+      process.exit(1);
+    }
+  })();
 }
-
