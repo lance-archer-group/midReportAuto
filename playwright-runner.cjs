@@ -1521,7 +1521,7 @@ function startTriggerServer() {
     const rawPath = (req.url || '/');
     const pathOnly = rawPath.split('?')[0].replace(/\/+$/, '') || '/';
     const method = req.method || 'GET';
-
+const allowGet = /^(1|true|yes|on)$/i.test(String(process.env.ALLOW_GET_RUN || ''));
     // Debug log so you can see exactly what hit you
     console.log(`[idle] ${method} ${rawPath} → ${pathOnly}`);
 
