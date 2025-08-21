@@ -6,7 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const { chromium } = require('playwright');
 require('dotenv').config();
-
+const http = require('http');
 // Optional IMAP for 2FA
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
@@ -1288,7 +1288,7 @@ async function countSelectedMids(page) {
 // ===== Main ==================================================================
 // ===== Main ==================================================================
 // ===== Main ==================================================================
-async function main() {
+async function runNetAchOnce() {
   console.log('▶️  Playwright Runner starting');
   console.log(`Node: ${process.version} (${process.platform} ${process.arch})`);
   console.log(`CWD: ${process.cwd()}`);
@@ -1469,14 +1469,118 @@ async function main() {
 }
 
 if (require.main === module) {
-  (async () => {
-    try {
-      await main();
-      // give stdout a moment to flush, then hard-exit
-      setTimeout(() => process.exit(0), Number(process.env.EXIT_FLUSH_MS || 200)).unref();
-    } catch (err) {
-      console.error(err);
-      process.exit(1);
+  const mode = (process.argv[2] || env('MODE', 'server')).toLowerCase();
+
+  if (mode === 'run' || bool(env('RUN_ON_START', 'false'))) {
+    // one-shot CLI mode (keeps your old behavior)
+    (async () => {
+      try {
+        await runNetAchOnce();
+        // optional exit for CI/cron
+        if (bool(env('EXIT_AFTER_RUN', 'true'))) process.exit(0);
+      } catch (err) {
+        console.error(err);
+        process.exit(1);
+      }
+    })();
+  } else {
+    // default: idle trigger server
+    startTriggerServer();
+  }
+}
+module.exports = { runNetAchOnce };
+
+
+let RUNNING = false;
+let LAST_RUN = null;
+let LAST_ERR = null;
+
+function json(res, code, payload) {
+  res.writeHead(code, { 'content-type': 'application/json' });
+  res.end(JSON.stringify(payload));
+}
+
+function parseBody(req) {
+  return new Promise((resolve) => {
+    let data = '';
+    req.on('data', (c) => (data += c));
+    req.on('end', () => {
+      try { resolve(data ? JSON.parse(data) : {}); }
+      catch { resolve({}); }
+    });
+  });
+}
+
+// Temporarily apply env overrides for a single run
+async function withEnv(overrides, fn) {
+  const prev = {};
+  for (const [k, v] of Object.entries(overrides || {})) {
+    prev[k] = process.env[k];
+    process.env[k] = String(v);
+  }
+  try {
+    return await fn();
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
     }
-  })();
+  }
+}
+
+function startTriggerServer() {
+  const port = numEnv('JOB_PORT', 3999);
+  const requiredKey = env('JOB_API_KEY', ''); // set this!
+
+  const server = http.createServer(async (req, res) => {
+    // Basic routing
+    if (req.method === 'GET' && req.url === '/health') {
+      return json(res, 200, { ok: true, running: RUNNING, lastRun: LAST_RUN, lastErr: LAST_ERR });
+    }
+    if (req.method === 'GET' && req.url === '/status') {
+      return json(res, 200, { running: RUNNING, lastRun: LAST_RUN, lastErr: LAST_ERR });
+    }
+
+    if (req.method === 'POST' && req.url.startsWith('/run')) {
+      // Auth
+      const key = req.headers['x-api-key'] || '';
+      if (requiredKey && key !== requiredKey) {
+        return json(res, 401, { error: 'unauthorized' });
+      }
+      if (RUNNING) {
+        return json(res, 409, { error: 'already running' });
+      }
+
+      // Optional overrides (e.g. { START: "2025-08-19", END: "2025-08-19", DATE_MODE: "custom" })
+      const body = await parseBody(req);
+
+      RUNNING = true;
+      LAST_ERR = null;
+      try {
+        const startedAt = new Date().toISOString();
+        await withEnv(body, async () => {
+          await runNetAchOnce(); // call your job
+        });
+        LAST_RUN = { ok: true, startedAt, finishedAt: new Date().toISOString() };
+        return json(res, 200, { ok: true, message: 'run completed' });
+      } catch (e) {
+        LAST_ERR = String(e?.message || e);
+        LAST_RUN = { ok: false, finishedAt: new Date().toISOString() };
+        return json(res, 500, { ok: false, error: LAST_ERR });
+      } finally {
+        RUNNING = false;
+      }
+    }
+
+    // Not found
+    json(res, 404, { error: 'not found' });
+  });
+
+  server.listen(port, () => {
+    console.log(`[idle] Trigger server listening on :${port}`);
+    console.log(`[idle] POST /run (with header x-api-key) to execute a run`);
+    console.log(`[idle] GET  /health or /status for liveness`);
+  });
+
+  return server;
 }
