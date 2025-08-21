@@ -1490,45 +1490,7 @@ if (require.main === module) {
 }
 module.exports = { runNetAchOnce };
 
-
-let RUNNING = false;
-let LAST_RUN = null;
-let LAST_ERR = null;
-
-function json(res, code, payload) {
-  res.writeHead(code, { 'content-type': 'application/json' });
-  res.end(JSON.stringify(payload));
-}
-
-function parseBody(req) {
-  return new Promise((resolve) => {
-    let data = '';
-    req.on('data', (c) => (data += c));
-    req.on('end', () => {
-      try { resolve(data ? JSON.parse(data) : {}); }
-      catch { resolve({}); }
-    });
-  });
-}
-
-// Temporarily apply env overrides for a single run
-async function withEnv(overrides, fn) {
-  const prev = {};
-  for (const [k, v] of Object.entries(overrides || {})) {
-    prev[k] = process.env[k];
-    process.env[k] = String(v);
-  }
-  try {
-    return await fn();
-  } finally {
-    for (const [k, v] of Object.entries(prev)) {
-      if (v === undefined) delete process.env[k];
-      else process.env[k] = v;
-    }
-  }
-}
-
-
+// ===== Idle Trigger Server ===================================================
 
 let RUNNING = false;
 let LAST_RUN = null;
