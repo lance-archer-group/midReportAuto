@@ -10,7 +10,11 @@ const http = require('http');
 // Optional IMAP for 2FA
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
-
+function json(res, status, obj) {
+  res.statusCode = status;
+  res.setHeader('content-type', 'application/json');
+  res.end(JSON.stringify(obj));
+}
 // ===== Env helpers ===========================================================
 function bool(v, d = true) {
   if (v == null || v === '') return d;
