@@ -17,6 +17,11 @@
     "start_date": "#fileDateStart",
     "end_date": "#fileDateEnd",
     "load_report": "#load",
-    "export_buttons": ["button.btn.green.export","button:has-text(\"Export\")","a:has-text(\"Export\")","button:has-text(\"Download\")","a:has-text(\"Download\")"]
+     "export_buttons": [
+      "section:has-text('REPORT RESULTS') button:has-text('Export')",
+      "section:has-text('REPORT RESULTS') a:has-text('Export')",
+      "section:has-text('REPORT RESULTS') input[type='button'][value='Export']",
+      "section:has-text('REPORT RESULTS') .btn-success:has-text('Export')"
+    ]
   }
 }
