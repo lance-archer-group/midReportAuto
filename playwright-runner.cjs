@@ -1531,7 +1531,7 @@ const allowGet = /^(1|true|yes|on)$/i.test(String(process.env.ALLOW_GET_RUN || '
     }
 
     // Run (accept POST; optionally GET if ALLOW_GET_RUN=1)
-    const allowGet = /^1|true|yes|on$/i.test(String(process.env.ALLOW_GET_RUN || ''));
+
     if ((method === 'POST' || (allowGet && method === 'GET')) && pathOnly === '/run') {
       const key = req.headers['x-api-key'] || '';
       if (requiredKey && key !== requiredKey) {
