@@ -10,18 +10,22 @@
     "mid_result_item": "#MID-catmultiselect-resultbox .catMSResultList li",
     "mid_chip": ".catMSValueList li",
     "run_button": "#load, button:has-text('Load report'), button:has-text('Run'), button:has-text('Search')",
-    "export_buttons": ["button.btn.green.export","button:has-text(\"Export\")","a:has-text(\"Export\")","button:has-text(\"Download\")","a:has-text(\"Download\")"]
+    "export_buttons": [
+      "div.portlet:has(.portlet-title .caption:has-text('REPORT RESULTS')) button.btn.green.export",
+      "div.portlet:has(.portlet-title .caption:has-text('REPORT RESULTS')) a.btn.green.export",
+      "div.portlet:has(.portlet-title .caption:has-text('REPORT RESULTS')) button:has-text('Export')",
+      "div.portlet:has(.portlet-title .caption:has-text('REPORT RESULTS')) a:has-text('Export')",
+      "div.portlet:has(.portlet-title .caption:has-text('REPORT RESULTS')) button:has(i.fa-table)",
+      "div.portlet:has(.portlet-title .caption:has-text('REPORT RESULTS')) a:has(i.fa-table)",
+      "div.portlet:has(.portlet-title .caption:has-text('REPORT RESULTS')) ul.inline-dropdown a:has-text('Export')"
+    ]
+
   },
   "ach": {
     "merchant_id": "#MID-catmultiselect",
     "start_date": "#fileDateStart",
     "end_date": "#fileDateEnd",
-    "load_report": "#load",
-     "export_buttons": [
-      "section:has-text('REPORT RESULTS') button:has-text('Export')",
-      "section:has-text('REPORT RESULTS') a:has-text('Export')",
-      "section:has-text('REPORT RESULTS') input[type='button'][value='Export']",
-      "section:has-text('REPORT RESULTS') .btn-success:has-text('Export')"
-    ]
+    "load_report": "#load"
   }
+
 }
