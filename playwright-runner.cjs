@@ -946,71 +946,92 @@ async function addMidsToAchReport(page, mids) {
 // Export (bulk) with deep diagnostics
 // replace your entire exportCurrentAch() with this version
 async function exportCurrentAch(page, outDir, tag = '') {
-  const navTimeout     = numEnv('NAV_TIMEOUT_MS', 15000);
-  const appearTimeout  = numEnv('EXPORT_BUTTON_APPEAR_MS', 5000); // fast fail
-  const exportTimeout  = numEnv('EXPORT_TIMEOUT_MS', 60000);
-  const diagDir        = path.join(ERROR_SHOTS, 'export_diag');
-  const tagName        = tag ? `net-ach${tag}` : 'net-ach';
+  const navTimeout    = numEnv('NAV_TIMEOUT_MS', 15000);
+  const appearTimeout = numEnv('EXPORT_BUTTON_APPEAR_MS', 8000);
+  const exportTimeout = numEnv('EXPORT_TIMEOUT_MS', 60000);
+  const diagDir       = path.join(ERROR_SHOTS, 'export_diag');
+  const tagName       = tag ? `net-ach${tag}` : 'net-ach';
 
   fs.mkdirSync(outDir, { recursive: true });
   fs.mkdirSync(diagDir, { recursive: true });
 
   const stamp = () => new Date().toISOString().replace(/[:.]/g, '-');
-
-  const saveArtifacts = async (label) => {
+  const saveArtifacts = async (frame, label) => {
     try {
       const sPath = path.join(diagDir, `${stamp()}-${label}.png`);
       const hPath = path.join(diagDir, `${stamp()}-${label}.html`);
-      await page.screenshot({ path: sPath, fullPage: true }).catch(() => {});
-      await fs.promises.writeFile(hPath, await page.content()).catch(() => {});
-      console.log('[EXPORT] saved artifacts:', sPath, '|', hPath);
+      await frame.page().screenshot({ path: sPath, fullPage: true }).catch(() => {});
+      await fs.promises.writeFile(hPath, await frame.page().content()).catch(() => {});
+      console.log('[EXPORT] artifacts:', sPath, '|', hPath);
     } catch {}
   };
 
-  // Narrow scope to the REPORT RESULTS card then find the Export control.
-  // These are robust, role-based and text-based locators.
-  const resultsCard = page.locator("section:has-text('REPORT RESULTS'), div:has-text('REPORT RESULTS')");
-  let exportBtn =
-    resultsCard.getByRole('button', { name: /export/i }).first();
+  // Preferred selectors (ordered from strict to loose)
+  const buttonSelectors = [
+    "button:has-text('Export')",
+    "a:has-text('Export')",
+    ".btn-success:has-text('Export')",
+    ".btn:has-text('Export')",
+    "button:has(i.fa-table)"
+  ];
+  const scopeSelectors = [
+    "section:has-text('REPORT RESULTS')",
+    "div.card:has-text('REPORT RESULTS')",
+    "div.panel:has-text('REPORT RESULTS')",
+    "main",
+    "body"
+  ];
 
-  // Fallbacks if role mapping is odd
-  if (!(await exportBtn.count())) {
-    exportBtn = resultsCard.locator(
-      [
-        "button:has-text('Export')",
-        "a:has-text('Export')",
-        "button.btn-success:has-text('Export')",
-        "a.btn-success:has-text('Export')",
-        "button:has(i.fa-table)",
-      ].join(', ')
-    ).first();
+  const frames = [page.mainFrame(), ...page.frames()];
+  console.log('[EXPORT] frame list:',
+    frames.map(f => ({ name: f.name(), url: f.url() })));
+
+  for (const frame of frames) {
+    for (const scopeSel of scopeSelectors) {
+      const scope = frame.locator(scopeSel);
+
+      for (const sel of buttonSelectors) {
+        const loc = scope.locator(sel).first();
+
+        // attach quickly; don't block on visibility if it's in an off-screen container
+        try {
+          await loc.waitFor({ state: 'attached', timeout: appearTimeout });
+        } catch {
+          continue; // not in this scope/selector -> next
+        }
+
+        // skip disabled controls
+        const disabled = await loc.getAttribute('disabled').catch(() => null);
+        if (disabled) continue;
+
+        try {
+          await loc.scrollIntoViewIfNeeded().catch(() => {});
+          const [download] = await Promise.all([
+            frame.page().waitForEvent('download', { timeout: exportTimeout }),
+            loc.click({ timeout: navTimeout }),
+          ]);
+
+          let suggested = null;
+          try { suggested = await download.suggestedFilename(); } catch {}
+          const ext = suggested ? path.extname(suggested) || '.xlsx' : '.xlsx';
+          const outPath = path.join(outDir, `${tagName}${ext}`);
+          await download.saveAs(outPath);
+          console.log('[EXPORT] downloaded →', outPath);
+          return outPath;
+        } catch (e) {
+          console.warn('[EXPORT] click/download attempt failed:', e?.message || e);
+          await saveArtifacts(frame, `export-failed-${frames.indexOf(frame)}`);
+          // try next selector/scope/frame
+        }
+      }
+    }
   }
 
-  // Make sure it’s there and visible quickly
-  await exportBtn.waitFor({ state: 'visible', timeout: appearTimeout });
-  await exportBtn.scrollIntoViewIfNeeded().catch(() => {});
-
-  // Click and wait for the download (ASP.NET usually fires a download event)
-  try {
-    const [download] = await Promise.all([
-      page.waitForEvent('download', { timeout: exportTimeout }),
-      exportBtn.click({ timeout: navTimeout, trial: false }), // noWaitAfter not needed for downloads
-    ]);
-
-    const suggested = await (async () => {
-      try { return await download.suggestedFilename(); } catch { return null; }
-    })();
-    const ext = suggested ? path.extname(suggested) || '.xlsx' : '.xlsx';
-    const outPath = path.join(outDir, `${tagName}${ext}`);
-    await download.saveAs(outPath);
-    console.log('[EXPORT] downloaded →', outPath);
-    return outPath;
-  } catch (e) {
-    console.warn('[EXPORT] download wait failed:', e?.message || e);
-    await saveArtifacts('export-failed');
-    throw new Error('Export button clicked, but no download started in time.');
-  }
+  // Nothing matched anywhere
+  await saveArtifacts(page.mainFrame(), 'export-not-found');
+  throw new Error('Export control not found in any frame/scope.');
 }
+
 async function searchAndDownloadACH(page, merchant, start, end, outDir) {
   const ach = SELECTORS.ach || {};
   if (!ach.merchant_id)
