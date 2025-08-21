@@ -1521,7 +1521,7 @@ function startTriggerServer() {
     const rawPath = (req.url || '/');
     const pathOnly = rawPath.split('?')[0].replace(/\/+$/, '') || '/';
     const method = req.method || 'GET';
-const allowGet = /^(1|true|yes|on)$/i.test(String(process.env.ALLOW_GET_RUN || ''));
+
     // Debug log so you can see exactly what hit you
     console.log(`[idle] ${method} ${rawPath} → ${pathOnly}`);
 
@@ -1539,7 +1539,7 @@ const allowGet = /^(1|true|yes|on)$/i.test(String(process.env.ALLOW_GET_RUN || '
         return json(res, 401, { error: 'unauthorized' });
       }
       if (RUNNING) return json(res, 409, { error: 'already running' });
-
+const allowGet = /^(1|true|yes|on)$/i.test(String(process.env.ALLOW_GET_RUN || ''));
       const overrides = method === 'POST' ? await parseBody(req) : {};
       RUNNING = true;
       LAST_ERR = null;
