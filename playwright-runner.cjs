@@ -1528,38 +1528,63 @@ async function withEnv(overrides, fn) {
   }
 }
 
+onst http = require('http');
+
+let RUNNING = false;
+let LAST_RUN = null;
+let LAST_ERR = null;
+
+function json(res, code, payload) {
+  res.writeHead(code, { 'content-type': 'application/json' });
+  res.end(JSON.stringify(payload));
+}
+
+function parseBody(req) {
+  return new Promise((resolve) => {
+    let data = '';
+    req.on('data', (c) => (data += c));
+    req.on('end', () => {
+      try { resolve(data ? JSON.parse(data) : {}); }
+      catch { resolve({}); }
+    });
+  });
+}
+
 function startTriggerServer() {
   const port = numEnv('JOB_PORT', 3999);
-  const requiredKey = env('JOB_API_KEY', ''); // set this!
+  const requiredKey = env('JOB_API_KEY', '');
 
   const server = http.createServer(async (req, res) => {
-    // Basic routing
-    if (req.method === 'GET' && req.url === '/health') {
+    // Normalize path: strip query + trailing slashes
+    const rawPath = (req.url || '/');
+    const pathOnly = rawPath.split('?')[0].replace(/\/+$/, '') || '/';
+    const method = req.method || 'GET';
+
+    // Debug log so you can see exactly what hit you
+    console.log(`[idle] ${method} ${rawPath} → ${pathOnly}`);
+
+    // Health
+    if (method === 'GET' && (pathOnly === '/health' || pathOnly === '/status')) {
       return json(res, 200, { ok: true, running: RUNNING, lastRun: LAST_RUN, lastErr: LAST_ERR });
     }
-    if (req.method === 'GET' && req.url === '/status') {
-      return json(res, 200, { running: RUNNING, lastRun: LAST_RUN, lastErr: LAST_ERR });
-    }
 
-    if (req.method === 'POST' && req.url.startsWith('/run')) {
-      // Auth
+    // Run (accept POST; optionally GET if ALLOW_GET_RUN=1)
+    const allowGet = /^1|true|yes|on$/i.test(String(process.env.ALLOW_GET_RUN || ''));
+    if ((method === 'POST' || (allowGet && method === 'GET')) && pathOnly === '/run') {
       const key = req.headers['x-api-key'] || '';
       if (requiredKey && key !== requiredKey) {
+        console.warn('[idle] unauthorized /run attempt');
         return json(res, 401, { error: 'unauthorized' });
       }
-      if (RUNNING) {
-        return json(res, 409, { error: 'already running' });
-      }
+      if (RUNNING) return json(res, 409, { error: 'already running' });
 
-      // Optional overrides (e.g. { START: "2025-08-19", END: "2025-08-19", DATE_MODE: "custom" })
-      const body = await parseBody(req);
-
+      const overrides = method === 'POST' ? await parseBody(req) : {};
       RUNNING = true;
       LAST_ERR = null;
       try {
         const startedAt = new Date().toISOString();
-        await withEnv(body, async () => {
-          await runNetAchOnce(); // call your job
+        await withEnv(overrides, async () => {
+          await runNetAchOnce();
         });
         LAST_RUN = { ok: true, startedAt, finishedAt: new Date().toISOString() };
         return json(res, 200, { ok: true, message: 'run completed' });
@@ -1573,13 +1598,14 @@ function startTriggerServer() {
     }
 
     // Not found
-    json(res, 404, { error: 'not found' });
+    json(res, 404, { error: 'not found', path: pathOnly, method });
   });
 
   server.listen(port, () => {
     console.log(`[idle] Trigger server listening on :${port}`);
     console.log(`[idle] POST /run (with header x-api-key) to execute a run`);
     console.log(`[idle] GET  /health or /status for liveness`);
+    if (allowGet) console.log(`[idle] GET /run enabled (ALLOW_GET_RUN=1)`);
   });
 
   return server;

@@ -5,4 +5,4 @@ set -eu
 
 curl -fsS --retry 3 --retry-connrefused --max-time 60 \
   -H "x-api-key:${JOB_API_KEY}" \
-  "http://127.0.0.1:${JOB_PORT}/run"
+  "http://127.0.0.1:${JOB_PORT}/run/"
