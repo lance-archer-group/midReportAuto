@@ -944,260 +944,72 @@ async function addMidsToAchReport(page, mids) {
 }
 
 // Export (bulk) with deep diagnostics
+// replace your entire exportCurrentAch() with this version
 async function exportCurrentAch(page, outDir, tag = '') {
-  const navTimeout = numEnv('NAV_TIMEOUT_MS', 15000);
-  const exportTimeout = numEnv('EXPORT_TIMEOUT_MS', 60000);
-  const appearTimeout = numEnv('EXPORT_BUTTON_APPEAR_MS', 15000);
+  const navTimeout     = numEnv('NAV_TIMEOUT_MS', 15000);
+  const appearTimeout  = numEnv('EXPORT_BUTTON_APPEAR_MS', 5000); // fast fail
+  const exportTimeout  = numEnv('EXPORT_TIMEOUT_MS', 60000);
+  const diagDir        = path.join(ERROR_SHOTS, 'export_diag');
+  const tagName        = tag ? `net-ach${tag}` : 'net-ach';
 
-  // SAFE suggested-filename helper (works for sync or Promise returns)
-  const getSuggested = async (download) => {
-    try {
-      if (!download || typeof download.suggestedFilename !== 'function')
-        return null;
-      const v = download.suggestedFilename();
-      return v && typeof v.then === 'function' ? await v : v;
-    } catch {
-      return null;
-    }
-  };
-
-  const expSelList = []
-    .concat(SELECTORS.ach?.export_buttons || [])
-    .concat(SELECTORS.reporting?.export_buttons || [])
-    .concat([
-      'button.btn.green.export',
-      'button.export',
-      "button:has-text('Export')",
-      "a:has-text('Export')",
-      "a[href*='/Reporting/ExportReport.aspx']",
-      'button:has(i.fa-table)',
-    ])
-    .filter(Boolean);
-
-  // diagnostics dir
-  const diagDir = path.join(ERROR_SHOTS, 'export_diag');
-  try {
-    fs.mkdirSync(outDir, { recursive: true });
-  } catch {}
-  try {
-    fs.mkdirSync(diagDir, { recursive: true });
-  } catch {}
+  fs.mkdirSync(outDir, { recursive: true });
+  fs.mkdirSync(diagDir, { recursive: true });
 
   const stamp = () => new Date().toISOString().replace(/[:.]/g, '-');
-  const tagName = tag ? `net-ach${tag}` : 'net-ach';
 
-  const logx = (...a) => console.log(`[EXPORT]`, ...a);
-
-  const saveArtifacts = async (frame, label) => {
+  const saveArtifacts = async (label) => {
     try {
       const sPath = path.join(diagDir, `${stamp()}-${label}.png`);
       const hPath = path.join(diagDir, `${stamp()}-${label}.html`);
-      await frame
-        .page()
-        .screenshot({ path: sPath, fullPage: true })
-        .catch(() => {});
-      await fs.promises
-        .writeFile(hPath, await frame.page().content())
-        .catch(() => {});
-      logx(`Saved artifacts for ${label}:`, sPath, ' | ', hPath);
-    } catch (e) {
-      logx('Artifact save failed:', e?.message || e);
-    }
+      await page.screenshot({ path: sPath, fullPage: true }).catch(() => {});
+      await fs.promises.writeFile(hPath, await page.content()).catch(() => {});
+      console.log('[EXPORT] saved artifacts:', sPath, '|', hPath);
+    } catch {}
   };
 
-  // Try to “click to download”, or use data-url if present
-  const attemptDownload = async (frame, loc, label) => {
-    // 1) Normal click → wait for download or export response
-    try {
-      const [dlOrResp] = await Promise.race([
-        Promise.all([
-          frame.page().waitForEvent('download', { timeout: exportTimeout }),
-          loc.click({ timeout: navTimeout }),
-        ]).then(([download]) => [{ kind: 'download', download }]),
-        frame
-          .page()
-          .waitForResponse(
-            (r) =>
-              /\/Reporting\/ExportReport\.aspx/i.test(r.url()) &&
-              r.status() < 400,
-            { timeout: exportTimeout }
-          )
-          .then((resp) => [{ kind: 'response', resp }]),
-      ]);
-      if (dlOrResp.kind === 'download') {
-        const suggested = await getSuggested(dlOrResp.download);
-        const ext = suggested ? path.extname(suggested) || '.xlsx' : '.xlsx';
-        const outPath = path.join(outDir, `${tagName}${ext}`);
-        await dlOrResp.download.saveAs(outPath);
-        logx(`Downloaded via normal click → ${outPath}`);
-        return outPath;
-      } else {
-        // Response path → navigate to trigger download
-        const url = dlOrResp.resp.url();
-        logx(`Got export response (${dlOrResp.resp.status()}): ${url}`);
-        const [download] = await Promise.all([
-          frame.page().waitForEvent('download', { timeout: exportTimeout }),
-          frame
-            .page()
-            .goto(url, { waitUntil: 'domcontentloaded', timeout: navTimeout })
-            .catch(() => {}),
-        ]);
-        const suggested = await getSuggested(download);
-        const ext = suggested ? path.extname(suggested) || '.xlsx' : '.xlsx';
-        const outPath = path.join(outDir, `${tagName}${ext}`);
-        await download.saveAs(outPath);
-        logx(`Downloaded after response→goto → ${outPath}`);
-        return outPath;
-      }
-    } catch (e) {
-      logx(`${label}: normal click failed:`, e?.message || e);
-    }
+  // Narrow scope to the REPORT RESULTS card then find the Export control.
+  // These are robust, role-based and text-based locators.
+  const resultsCard = page.locator("section:has-text('REPORT RESULTS'), div:has-text('REPORT RESULTS')");
+  let exportBtn =
+    resultsCard.getByRole('button', { name: /export/i }).first();
 
-    // 2) data-url attribute → absolute GET
-    try {
-      const dataUrl = await loc.getAttribute('data-url').catch(() => null);
-      if (dataUrl) {
-        const base = env('ELEVATE_BASE', 'https://portal.elevateqs.com');
-        const origin = (() => {
-          try {
-            return new URL(base).origin;
-          } catch {
-            return 'https://portal.elevateqs.com';
-          }
-        })();
-        const abs = origin + dataUrl;
-        logx(`${label}: using data-url → ${abs}`);
-
-        const [download] = await Promise.all([
-          frame.page().waitForEvent('download', { timeout: exportTimeout }),
-          frame
-            .page()
-            .goto(abs, { waitUntil: 'domcontentloaded', timeout: navTimeout })
-            .catch(() => {}),
-        ]);
-        const suggested = await getSuggested(download);
-        const ext = suggested ? path.extname(suggested) || '.xlsx' : '.xlsx';
-        const outPath = path.join(outDir, `${tagName}${ext}`);
-        await download.saveAs(outPath);
-        logx(`Downloaded via data-url → ${outPath}`);
-        return outPath;
-      }
-    } catch (e) {
-      logx(`${label}: data-url path failed:`, e?.message || e);
-    }
-
-    // 3) Force click
-    try {
-      const [download] = await Promise.all([
-        frame.page().waitForEvent('download', { timeout: exportTimeout }),
-        loc.click({ timeout: navTimeout, force: true }),
-      ]);
-      const suggested = await getSuggested(download);
-      const ext = suggested ? path.extname(suggested) || '.xlsx' : '.xlsx';
-      const outPath = path.join(outDir, `${tagName}${ext}`);
-      await download.saveAs(outPath);
-      logx(`Downloaded via force click → ${outPath}`);
-      return outPath;
-    } catch (e) {
-      logx(`${label}: force click failed:`, e?.message || e);
-    }
-
-    // 4) JS click (sometimes helps with shadow/overlay)
-    try {
-      await loc.evaluate((el) => el.click());
-      const download = await frame
-        .page()
-        .waitForEvent('download', { timeout: exportTimeout });
-      const suggested = await getSuggested(download);
-      const ext = suggested ? path.extname(suggested) || '.xlsx' : '.xlsx';
-      const outPath = path.join(outDir, `${tagName}${ext}`);
-      await download.saveAs(outPath);
-      logx(`Downloaded via JS click → ${outPath}`);
-      return outPath;
-    } catch (e) {
-      logx(`${label}: JS click failed:`, e?.message || e);
-    }
-
-    return null;
-  };
-
-  // Attribute & state dump for a locator
-  const dumpLocator = async (loc, label) => {
-    try {
-      const count = await loc.count().catch(() => 0);
-      if (!count) {
-        logx(`${label}: count=0`);
-        return;
-      }
-      const first = loc.first();
-      const vis = await first.isVisible().catch(() => false);
-      const ena = await first.isEnabled().catch(() => false);
-      const bb = await first.boundingBox().catch(() => null);
-      const attrs = await first
-        .evaluate((el) => ({
-          id: el.id || null,
-          class: el.className || null,
-          name: el.getAttribute('name'),
-          href: el.getAttribute('href'),
-          dataUrl: el.getAttribute('data-url'),
-          disabled: el.getAttribute('disabled'),
-          text: el.textContent?.trim().slice(0, 120) || null,
-        }))
-        .catch(() => ({}));
-      logx(
-        `${label}: count=${count}, visible=${vis}, enabled=${ena}, bbox=${
-          bb
-            ? `${Math.round(bb.x)},${Math.round(bb.y)} ${Math.round(
-                bb.width
-              )}x${Math.round(bb.height)}`
-            : 'n/a'
-        }`
-      );
-      logx(`${label}: attrs=`, attrs);
-    } catch (e) {
-      logx(`${label}: dump failed:`, e?.message || e);
-    }
-  };
-
-  const frames = [page.mainFrame(), ...page.frames()];
-  logx(`Frames: ${frames.length}, selectors to try:`, expSelList);
-
-  // Pass 1: standard loop
-  for (let fi = 0; fi < frames.length; fi++) {
-    const frame = frames[fi];
-    const flabel = `frame#${fi}${frame === page.mainFrame() ? '(main)' : ''}`;
-    logx(`Scanning ${flabel}`);
-
-    for (let si = 0; si < expSelList.length; si++) {
-      const sel = expSelList[si];
-      const loc = frame.locator(sel).first();
-      const label = `${flabel} sel[${si}]=${sel}`;
-      try {
-        await loc.waitFor({ state: 'attached', timeout: appearTimeout });
-      } catch {
-        continue;
-      }
-
-      await dumpLocator(loc, label);
-
-      try {
-        await loc.scrollIntoViewIfNeeded({ timeout: 1000 });
-      } catch {}
-
-      const out = await attemptDownload(frame, loc, label);
-      if (out) return out;
-
-      await saveArtifacts(frame, `after-fail-${fi}-${si}`);
-    }
+  // Fallbacks if role mapping is odd
+  if (!(await exportBtn.count())) {
+    exportBtn = resultsCard.locator(
+      [
+        "button:has-text('Export')",
+        "a:has-text('Export')",
+        "button.btn-success:has-text('Export')",
+        "a.btn-success:has-text('Export')",
+        "button:has(i.fa-table)",
+      ].join(', ')
+    ).first();
   }
 
-  // Pass 2: Give it one more chance after a small wait, then full snapshot
-  await page.waitForTimeout(1000).catch(() => {});
-  await saveArtifacts(page.mainFrame(), 'final-state');
+  // Make sure it’s there and visible quickly
+  await exportBtn.waitFor({ state: 'visible', timeout: appearTimeout });
+  await exportBtn.scrollIntoViewIfNeeded().catch(() => {});
 
-  throw new Error(
-    'ACH export/download button not matched (checked all frames and fallbacks).'
-  );
+  // Click and wait for the download (ASP.NET usually fires a download event)
+  try {
+    const [download] = await Promise.all([
+      page.waitForEvent('download', { timeout: exportTimeout }),
+      exportBtn.click({ timeout: navTimeout, trial: false }), // noWaitAfter not needed for downloads
+    ]);
+
+    const suggested = await (async () => {
+      try { return await download.suggestedFilename(); } catch { return null; }
+    })();
+    const ext = suggested ? path.extname(suggested) || '.xlsx' : '.xlsx';
+    const outPath = path.join(outDir, `${tagName}${ext}`);
+    await download.saveAs(outPath);
+    console.log('[EXPORT] downloaded →', outPath);
+    return outPath;
+  } catch (e) {
+    console.warn('[EXPORT] download wait failed:', e?.message || e);
+    await saveArtifacts('export-failed');
+    throw new Error('Export button clicked, but no download started in time.');
+  }
 }
 async function searchAndDownloadACH(page, merchant, start, end, outDir) {
   const ach = SELECTORS.ach || {};
