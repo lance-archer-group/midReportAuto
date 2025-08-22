@@ -1195,37 +1195,35 @@ async function runNetAchOnce() {
     console.log('[main] login complete. URL:', page.url());
 
     // --- 2FA (IMAP) if present ---
-  try {
-  await page.waitForTimeout(numEnv('MFA_READY_WAIT_MS', 1000));
+    try {
+      await page.waitForTimeout(numEnv('MFA_READY_WAIT_MS', 1000));
 
-  const has2fa = await twofaScreenPresent(page);
-  if (!has2fa) {
-    console.log('[2FA] screen not detected; continuing.');
-  } else {
-    console.log('[2FA] screen detected — fetching code via IMAP…');
+      const has2fa = await twofaScreenPresent(page);
+      if (!has2fa) {
+        console.log('[2FA] screen not detected; continuing.');
+      } else {
+        console.log('[2FA] screen detected — fetching code via IMAP…');
 
-    // Wait for a code (waitFor2faCode must throw if it can’t find one)
-    const code = await waitFor2faCode(); // <- uses your existing get2faCodeFromImap()
-    await submitTwofaCode(page, code);
-    await page.waitForTimeout(numEnv('POST_2FA_PAUSE_MS', 800));
+        const code = await waitFor2faCode();
+        await submitTwofaCode(page, code);
+        await page.waitForTimeout(numEnv('POST_2FA_PAUSE_MS', 800));
 
-    // Verify we actually cleared the gate
-    if (await twofaScreenPresent(page)) {
-      throw new Error('2FA screen still visible after submitting code');
+        if (await twofaScreenPresent(page)) {
+          throw new Error('2FA screen still visible after submitting code');
+        }
+
+        summary.mfa = {
+          via: 'imap',
+          subject: env('IMAP_SUBJECT_FILTER', ''),
+          from: env('IMAP_FROM_FILTER', ''),
+        };
+        console.log('[2FA] done.');
+      }
+    } catch (e) {
+      console.error('[2FA] failed:', e?.message || e);
+      summary.mfa = { error: e?.message || String(e) };
+      throw e; // hard fail if 2FA required
     }
-
-    summary.mfa = {
-      via: 'imap',
-      subject: env('IMAP_SUBJECT_FILTER', ''),
-      from: env('IMAP_FROM_FILTER', ''),
-    };
-    console.log('[2FA] done.');
-  }
-} catch (e) {
-  console.error('[2FA] failed:', e?.message || e);
-  summary.mfa = { error: e?.message || String(e) };
-  throw e; // hard-fail: do NOT continue to reporting if 2FA required and failed
-}
 
     // --- Navigate to report ---
     console.log('[nav] goto Advanced Reporting…');
@@ -1253,50 +1251,13 @@ async function runNetAchOnce() {
     // --- Run report ---
     console.log('[report] click Load report…');
     await clickLoadReport(page);
-const RESULTS_TIMEOUT = numEnv('RESULTS_TIMEOUT_MS', 30000);
-const EXPORT_TIMEOUT  = numEnv('EXPORT_TIMEOUT_MS', 90000);
-const NAV_TIMEOUT     = numEnv('NAV_TIMEOUT_MS', 15000);
 
-const results = page.locator(
-  "div.portlet:has(.portlet-title .caption:has-text('REPORT RESULTS'))"
-);
-await results.waitFor({ state: 'attached', timeout: RESULTS_TIMEOUT });
-
-// (Optional) also wait for the table body/rows to attach
-await results
-  .locator(".tableScrollWrap table, .tableScrollWrap .table, table")
-  .first()
-  .waitFor({ state: 'attached', timeout: RESULTS_TIMEOUT })
-  .catch(() => {});
-
-// Resolve Export inside the results portlet (covers button, link, icon, dropdown)
-const exportLoc = results.locator([
-  "button.btn.green.export",
-  "a.btn.green.export",
-  "button:has-text('Export')",
-  "a:has-text('Export')",
-  "button:has(i.fa-table)",
-  "a:has(i.fa-table)",
-  "ul.inline-dropdown a:has-text('Export')"
-].join(", ")).first();
-
-// Don’t require visibility — attach is enough; scroll then click
-await exportLoc.waitFor({ state: 'attached', timeout: RESULTS_TIMEOUT });
-await exportLoc.scrollIntoViewIfNeeded().catch(() => {});
-
-const [download] = await Promise.all([
-  page.waitForEvent('download', { timeout: EXPORT_TIMEOUT }),
-  exportLoc.click({ timeout: NAV_TIMEOUT })
-]);
-
-const suggested = await download.suggestedFilename().catch(() => null);
-const outPath = path.join(dayDir, `net-ach-${Date.now()}${suggested ? path.extname(suggested) || '.xlsx' : '.xlsx'}`);
-await download.saveAs(outPath);
-    // --- Export (combined) ---
+    // --- Export (combined) — single robust path that scans frames & fallbacks ---
     console.log('[export] exporting combined file…');
     const bulkTag  = `-${mids.length}-mids`;
     const bulkPath = await exportCurrentAch(page, dayDir, bulkTag);
 
+    // Mark success for every merchant (same combined file)
     for (const m of summary.merchants) {
       m.status = 'ok';
       m.files = [bulkPath];
