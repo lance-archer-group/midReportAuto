@@ -6,11 +6,8 @@
 // ===== Env loading (base .env, then overrides from .env.netach or ENV_FILE) ====
 const path = require('path');
 require('dotenv').config(); // loads .env
-const overrideEnvPath = process.env.ENV_FILE || path.join(__dirname, '.env.netach');
-try {
-  require('dotenv').config({ path: overrideEnvPath, override: true });
-  console.log(`[dotenv] loaded override from ${overrideEnvPath}`);
-} catch { /* optional */ }
+
+
 
 // ===== Imports ================================================================
 const fs = require('fs');
