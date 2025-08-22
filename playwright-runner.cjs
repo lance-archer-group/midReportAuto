@@ -946,90 +946,144 @@ async function addMidsToAchReport(page, mids) {
 // Export (bulk) with deep diagnostics
 // replace your entire exportCurrentAch() with this version
 async function exportCurrentAch(page, outDir, tag = '') {
-  const navTimeout    = numEnv('NAV_TIMEOUT_MS', 15000);
-  const appearTimeout = numEnv('EXPORT_BUTTON_APPEAR_MS', 8000);
-  const exportTimeout = numEnv('EXPORT_TIMEOUT_MS', 60000);
-  const diagDir       = path.join(ERROR_SHOTS, 'export_diag');
-  const tagName       = tag ? `net-ach${tag}` : 'net-ach';
+  const navTimeout     = numEnv('NAV_TIMEOUT_MS', 15000);
+  const exportTimeout  = numEnv('EXPORT_TIMEOUT_MS', 90000);
+  const resultsTimeout = numEnv('RESULTS_TIMEOUT_MS', 60000);
 
-  fs.mkdirSync(outDir, { recursive: true });
-  fs.mkdirSync(diagDir, { recursive: true });
+  const tagName = tag ? `net-ach${tag}` : 'net-ach';
+  try { fs.mkdirSync(outDir, { recursive: true }); } catch {}
 
-  const stamp = () => new Date().toISOString().replace(/[:.]/g, '-');
-  const saveArtifacts = async (frame, label) => {
+  const logx = (...a) => console.log('[EXPORT]', ...a);
+
+  // 1) Wait for results area to exist (very tolerant on title text)
+  const results = page.locator([
+    "div.portlet:has(.portlet-title .caption:has-text('REPORT RESULTS'))",
+    "div.portlet:has(.portlet-title .caption:has-text('Results'))",
+    "div.portlet:has(.portlet-title .caption:has-text('Net ACH'))"
+  ].join(', ')).first();
+  await results.waitFor({ state: 'attached', timeout: resultsTimeout }).catch(() => {});
+  await results.locator(".tableScrollWrap, table").first()
+    .waitFor({ state: 'attached', timeout: resultsTimeout }).catch(() => {});
+  logx('results attached');
+
+  // Helper: click a locator and capture a download, with a few styles
+  const clickAndDownload = async (loc, label) => {
     try {
-      const sPath = path.join(diagDir, `${stamp()}-${label}.png`);
-      const hPath = path.join(diagDir, `${stamp()}-${label}.html`);
-      await frame.page().screenshot({ path: sPath, fullPage: true }).catch(() => {});
-      await fs.promises.writeFile(hPath, await frame.page().content()).catch(() => {});
-      console.log('[EXPORT] artifacts:', sPath, '|', hPath);
-    } catch {}
+      await loc.scrollIntoViewIfNeeded().catch(() => {});
+      const [download] = await Promise.all([
+        page.waitForEvent('download', { timeout: exportTimeout }),
+        loc.click({ timeout: navTimeout })
+      ]);
+      const suggested = await download.suggestedFilename().catch(() => null);
+      const ext = suggested ? (path.extname(suggested) || '.xlsx') : '.xlsx';
+      const outPath = path.join(outDir, `${tagName}${ext}`);
+      await download.saveAs(outPath);
+      logx(`${label}: download saved →`, outPath);
+      return outPath;
+    } catch (e) {
+      logx(`${label}: click/download failed:`, e?.message || e);
+      return null;
+    }
   };
 
-  // Preferred selectors (ordered from strict to loose)
-  const buttonSelectors = [
-    "button:has-text('Export')",
-    "a:has-text('Export')",
-    ".btn-success:has-text('Export')",
-    ".btn:has-text('Export')",
-    "button:has(i.fa-table)"
-  ];
-  const scopeSelectors = [
-    "section:has-text('REPORT RESULTS')",
-    "div.card:has-text('REPORT RESULTS')",
-    "div.panel:has-text('REPORT RESULTS')",
-    "main",
-    "body"
-  ];
+  // 2) Pass A — global, obvious export controls (don’t scope to results)
+  const globals = []
+    .concat(SELECTORS.ach?.export_buttons || [])
+    .concat(SELECTORS.reporting?.export_buttons || [])
+    .concat([
+      "button.btn.green.export",
+      "a.btn.green.export",
+      "button:has-text('Export')",
+      "a:has-text('Export')",
+      "button:has(i.fa-table)",
+      "a:has(i.fa-table)",
+      "a[href*='/Reporting/ExportReport.aspx']",
+      "[data-url*='/Reporting/ExportReport.aspx']"
+    ]);
 
-  const frames = [page.mainFrame(), ...page.frames()];
-  console.log('[EXPORT] frame list:',
-    frames.map(f => ({ name: f.name(), url: f.url() })));
-
-  for (const frame of frames) {
-    for (const scopeSel of scopeSelectors) {
-      const scope = frame.locator(scopeSel);
-
-      for (const sel of buttonSelectors) {
-        const loc = scope.locator(sel).first();
-
-        // attach quickly; don't block on visibility if it's in an off-screen container
-        try {
-          await loc.waitFor({ state: 'attached', timeout: appearTimeout });
-        } catch {
-          continue; // not in this scope/selector -> next
-        }
-
-        // skip disabled controls
-        const disabled = await loc.getAttribute('disabled').catch(() => null);
-        if (disabled) continue;
-
-        try {
-          await loc.scrollIntoViewIfNeeded().catch(() => {});
-          const [download] = await Promise.all([
-            frame.page().waitForEvent('download', { timeout: exportTimeout }),
-            loc.click({ timeout: navTimeout }),
-          ]);
-
-          let suggested = null;
-          try { suggested = await download.suggestedFilename(); } catch {}
-          const ext = suggested ? path.extname(suggested) || '.xlsx' : '.xlsx';
-          const outPath = path.join(outDir, `${tagName}${ext}`);
-          await download.saveAs(outPath);
-          console.log('[EXPORT] downloaded →', outPath);
-          return outPath;
-        } catch (e) {
-          console.warn('[EXPORT] click/download attempt failed:', e?.message || e);
-          await saveArtifacts(frame, `export-failed-${frames.indexOf(frame)}`);
-          // try next selector/scope/frame
-        }
-      }
+  for (const sel of globals) {
+    const loc = page.locator(sel).first();
+    if (await loc.count()) {
+      // If this is a data-url, we’ll handle below; try normal click first.
+      const out = await clickAndDownload(loc, `global ${sel}`);
+      if (out) return out;
     }
   }
 
-  // Nothing matched anywhere
-  await saveArtifacts(page.mainFrame(), 'export-not-found');
-  throw new Error('Export control not found in any frame/scope.');
+  // 3) Pass B — open dropdown/toggle controls in/near the results portlet,
+  // then retry finding an Export entry in the opened menu(s).
+  const toggles = results.locator([
+    ".portlet-title .actions .dropdown-toggle",
+    ".btn-group > a.dropdown-toggle",
+    "a.inline-dropdown-toggle",
+    "button.dropdown-toggle",
+    ".portlet-title .actions a:has(i.fa-angle-down)",
+    ".portlet-title .actions a:has(i.fa-share)"
+  ].join(', '));
+  const tCount = await toggles.count().catch(() => 0);
+  logx('toggle candidates:', tCount);
+
+  for (let i = 0; i < tCount; i++) {
+    const t = toggles.nth(i);
+    try {
+      await t.scrollIntoViewIfNeeded().catch(() => {});
+      await t.click({ timeout: navTimeout });
+      await page.waitForTimeout(200);
+    } catch {}
+    // menus that appear after clicking the toggle
+    const menuExport = page.locator([
+      "ul.dropdown-menu a:has-text('Export')",
+      "ul.inline-dropdown a:has-text('Export')",
+      "ul.dropdown-menu a:has(i.fa-table)",
+      "ul.inline-dropdown a:has(i.fa-table)"
+    ].join(', ')).first();
+
+    if (await menuExport.count()) {
+      const out = await clickAndDownload(menuExport, 'menu export');
+      if (out) return out;
+    }
+  }
+
+  // 4) Pass C — explicit ExportReport link/data-url inside results subtree
+  const hrefExport = results.locator("a[href*='/Reporting/ExportReport.aspx']").first();
+  if (await hrefExport.count()) {
+    try {
+      const [download] = await Promise.all([
+        page.waitForEvent('download', { timeout: exportTimeout }),
+        hrefExport.click({ timeout: navTimeout })
+      ]);
+      const suggested = await download.suggestedFilename().catch(() => null);
+      const ext = suggested ? (path.extname(suggested) || '.xlsx') : '.xlsx';
+      const outPath = path.join(outDir, `${tagName}${ext}`);
+      await download.saveAs(outPath);
+      logx('href ExportReport →', outPath);
+      return outPath;
+    } catch (e) { logx('href ExportReport failed:', e?.message || e); }
+  }
+
+  const dataUrlNode = results.locator("[data-url*='/Reporting/ExportReport.aspx']").first();
+  if (await dataUrlNode.count()) {
+    const dataUrl = await dataUrlNode.getAttribute('data-url').catch(() => null);
+    if (dataUrl) {
+      const base = env('ELEVATE_BASE', 'https://portal.elevateqs.com');
+      const origin = (() => { try { return new URL(base).origin; } catch { return 'https://portal.elevateqs.com'; } })();
+      const abs = origin + dataUrl;
+      try {
+        const [download] = await Promise.all([
+          page.waitForEvent('download', { timeout: exportTimeout }),
+          page.goto(abs, { timeout: navTimeout, waitUntil: 'domcontentloaded' }).catch(() => {})
+        ]);
+        const suggested = await download.suggestedFilename().catch(() => null);
+        const ext = suggested ? (path.extname(suggested) || '.xlsx') : '.xlsx';
+        const outPath = path.join(outDir, `${tagName}${ext}`);
+        await download.saveAs(outPath);
+        logx('data-url ExportReport →', outPath);
+        return outPath;
+      } catch (e) { logx('data-url ExportReport failed:', e?.message || e); }
+    }
+  }
+
+  throw new Error('ACH export/download control not found after scanning globals, opening dropdowns, and URL fallbacks.');
 }
 
 async function searchAndDownloadACH(page, merchant, start, end, outDir) {
