@@ -981,7 +981,13 @@ async function exportCurrentAch(page, outDir, tag = '') {
   const exportTimeout = numEnv('EXPORT_TIMEOUT_MS', 60000);
   const diagDir       = path.join(ERROR_SHOTS, 'export_diag');
   const tagName       = tag ? `net-ach${tag}` : 'net-ach';
-
+try {
+  const exists = await page.locator('#resultsCont #mainRepHead .btn.green.export[data-url]').first().count();
+  if (exists) {
+    const baseTag = tag ? `net-ach${tag}` : 'net-ach';
+    return await exportViaDataUrl(page, outDir, baseTag);
+  }
+} catch (_){
   fs.mkdirSync(outDir, { recursive: true });
   fs.mkdirSync(diagDir, { recursive: true });
 
@@ -1129,7 +1135,7 @@ async function exportCurrentAch(page, outDir, tag = '') {
       }
     }
   }
-
+}
   await saveArtifacts(page.mainFrame(), 'export-not-found');
   throw new Error('Export control not found or did not yield a downloadable file.');
 }
