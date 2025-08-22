@@ -6,7 +6,7 @@
 // ===== Env loading (base .env, then overrides from .env.netach or ENV_FILE) ====
 const path = require('path');
 require('dotenv').config(); // loads .env
-
+const nodemailer = require('nodemailer');
 
 
 // ===== Imports ================================================================
@@ -80,7 +80,65 @@ async function withStablePage(page, fn, timeoutMs = 15000) {
     }
   }
 }
+async function emailReport(fileArg, overrides = {}) {
+  try {
+    const to = env('EMAIL_TO', '');
+    if (!to) {
+      console.log('[EMAIL] EMAIL_TO not set — skipping send.');
+      return;
+    }
 
+    // Prefer explicit SMTP_*; fall back to IMAP_* you already use for 2FA
+    const host   = env('SMTP_HOST', env('IMAP_HOST', 'smtp.gmail.com').replace(/^imap\./i, 'smtp.'));
+    const port   = numEnv('SMTP_PORT', 465);
+    const secure = bool(env('SMTP_SECURE', 'true'), true); // true=SMTPS/465, false=STARTTLS/587
+    const user   = env('SMTP_USER', env('IMAP_USER'));
+    const pass   = env('SMTP_PASS', env('IMAP_PASS'));
+    const from   = env('EMAIL_FROM', user);
+
+    // normalize attachment input
+    let filePath = null;
+    if (typeof fileArg === 'string') {
+      filePath = fileArg;
+    } else if (fileArg && typeof fileArg === 'object' && typeof fileArg.path === 'string') {
+      filePath = fileArg.path;
+    } else {
+      throw new Error('emailReport() expected a string file path or { path: string }');
+    }
+    if (!fs.existsSync(filePath)) {
+      throw new Error(`Attachment not found on disk: ${filePath}`);
+    }
+
+    const filename = overrides.filename || path.basename(filePath);
+    const subject  = overrides.subject  || env('EMAIL_SUBJECT', `Net ACH Export ${new Date().toISOString().slice(0,10)}`);
+    const text     = overrides.text     || env('EMAIL_BODY', 'Attached is the Net ACH export.');
+    const contentType =
+      path.extname(filename).toLowerCase() === '.xlsx'
+        ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        : undefined;
+
+    console.log('[EMAIL] preparing send', { host, port, secure, to, from, filename });
+
+    const transporter = nodemailer.createTransport({
+      host,
+      port,
+      secure,
+      auth: { user, pass },
+    });
+
+    const info = await transporter.sendMail({
+      from,
+      to,
+      subject,
+      text,
+      attachments: [{ filename, path: filePath, contentType }],
+    });
+
+    console.log(`[EMAIL] sent ok: messageId=${info.messageId}`);
+  } catch (err) {
+    console.error('[EMAIL] send failed:', err?.message || err);
+  }
+}
 // ===== IMAP 2FA helpers ======================================================
 async function get2faCodeFromImap() {
   const host   = env('IMAP_HOST', 'imap.gmail.com');
