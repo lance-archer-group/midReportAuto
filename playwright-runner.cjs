@@ -945,145 +945,209 @@ async function addMidsToAchReport(page, mids) {
 
 // Export (bulk) with deep diagnostics
 // replace your entire exportCurrentAch() with this version
-async function exportCurrentAch(page, outDir, tag = '') {
-  const navTimeout     = numEnv('NAV_TIMEOUT_MS', 15000);
-  const exportTimeout  = numEnv('EXPORT_TIMEOUT_MS', 90000);
-  const resultsTimeout = numEnv('RESULTS_TIMEOUT_MS', 60000);
+import path from 'path';
+import fs from 'fs';
 
-  const tagName = tag ? `net-ach${tag}` : 'net-ach';
-  try { fs.mkdirSync(outDir, { recursive: true }); } catch {}
+// Helper: robust wait for a download (or a new page that triggers one)
+async function waitForDownloadAny(page: import('@playwright/test').Page, exportTimeout: number) {
+  // 1) direct download
+  const direct = page.waitForEvent('download', { timeout: exportTimeout })
+    .then(d => ({ type: 'download', download: d }))
+    .catch(() => null);
 
-  const logx = (...a) => console.log('[EXPORT]', ...a);
+  // 2) a new page opens and triggers a download
+  const ctx = page.context();
+  const newPage = ctx.waitForEvent('page', { timeout: exportTimeout })
+    .then(async p => {
+      try {
+        // if the new page triggers a download right away
+        const dl = await p.waitForEvent('download', { timeout: Math.max(1000, exportTimeout / 2) });
+        return { type: 'download', download: dl };
+      } catch {
+        return { type: 'page', page: p };
+      }
+    })
+    .catch(() => null);
 
-  // 1) Wait for results area to exist (very tolerant on title text)
-  const results = page.locator([
-    "div.portlet:has(.portlet-title .caption:has-text('REPORT RESULTS'))",
-    "div.portlet:has(.portlet-title .caption:has-text('Results'))",
-    "div.portlet:has(.portlet-title .caption:has-text('Net ACH'))"
-  ].join(', ')).first();
-  await results.waitFor({ state: 'attached', timeout: resultsTimeout }).catch(() => {});
-  await results.locator(".tableScrollWrap, table").first()
-    .waitFor({ state: 'attached', timeout: resultsTimeout }).catch(() => {});
-  logx('results attached');
+  // 3) same page navigates to a file (some apps do this)
+  const nav = page.waitForNavigation({ timeout: exportTimeout, waitUntil: 'networkidle' })
+    .then(() => ({ type: 'navigation' }))
+    .catch(() => null);
 
-  // Helper: click a locator and capture a download, with a few styles
-  const clickAndDownload = async (loc, label) => {
+  const winner = await Promise.race([direct, newPage, nav].filter(Boolean) as any[]);
+  return winner;
+}
+
+export async function exportCurrentAch(page, outDir, tag = '') {
+  const navTimeout    = numEnv('NAV_TIMEOUT_MS', 15000);
+  const appearTimeout = numEnv('EXPORT_BUTTON_APPEAR_MS', 8000);
+  const exportTimeout = numEnv('EXPORT_TIMEOUT_MS', 60000);
+  const diagDir       = path.join(ERROR_SHOTS, 'export_diag');
+  const tagName       = tag ? `net-ach${tag}` : 'net-ach';
+
+  fs.mkdirSync(outDir, { recursive: true });
+  fs.mkdirSync(diagDir, { recursive: true });
+
+  const stamp = () => new Date().toISOString().replace(/[:.]/g, '-');
+  const saveArtifacts = async (frameLike, label) => {
     try {
-      await loc.scrollIntoViewIfNeeded().catch(() => {});
-      const [download] = await Promise.all([
-        page.waitForEvent('download', { timeout: exportTimeout }),
-        loc.click({ timeout: navTimeout })
-      ]);
-      const suggested = await download.suggestedFilename().catch(() => null);
-      const ext = suggested ? (path.extname(suggested) || '.xlsx') : '.xlsx';
-      const outPath = path.join(outDir, `${tagName}${ext}`);
-      await download.saveAs(outPath);
-      logx(`${label}: download saved →`, outPath);
-      return outPath;
+      const pg = 'page' in frameLike ? frameLike.page() : page;
+      const sPath = path.join(diagDir, `${stamp()}-${label}.png`);
+      const hPath = path.join(diagDir, `${stamp()}-${label}.html`);
+      await pg.screenshot({ path: sPath, fullPage: true }).catch(() => {});
+      await fs.promises.writeFile(hPath, await pg.content()).catch(() => {});
+      console.log('[EXPORT] artifacts:', sPath, '|', hPath);
+    } catch {}
+  };
+
+  // Candidates we’ll try globally first (best → looser)
+  const globalCandidates = [
+    // role-based is strongest
+    () => page.getByRole('button', { name: /export|download/i }),
+    () => page.getByRole('link', { name: /export|download/i }),
+    // fallback CSS/text combos
+    () => page.locator('button:has-text("Export")'),
+    () => page.locator('a:has-text("Export")'),
+    () => page.locator('.btn-success:has-text("Export")'),
+    () => page.locator('.btn:has-text("Export")'),
+    () => page.locator('button:has(i.fa-table), a:has(i.fa-table)'),
+  ];
+
+  // Scopes to try *if* the global pass finds nothing
+  const scopeSelectors = [
+    'section:has-text("REPORT RESULTS")',
+    'div.card:has-text("REPORT RESULTS")',
+    'div.panel:has-text("REPORT RESULTS")',
+    'main',
+    'body',
+  ];
+
+  // A helper to click an export target (single click or button→menu)
+  const tryClickExport = async (target) => {
+    try {
+      await target.waitFor({ state: 'attached', timeout: appearTimeout });
+
+      // If the element exists but is not usable, bail
+      if (!(await target.isVisible({ timeout: 250 }).catch(() => false))) {
+        // sometimes offscreen; try scroll
+        await target.scrollIntoViewIfNeeded().catch(() => {});
+      }
+      // Enabled check covers aria-disabled etc.
+      if (!(await target.isEnabled({ timeout: 250 }).catch(() => false))) {
+        return false;
+      }
+
+      // Attempt: simple one-click download or open menu
+      const action = (async () => {
+        const winner = await waitForDownloadAny(page, exportTimeout);
+        return winner;
+      })();
+
+      await target.click({ timeout: navTimeout });
+
+      const winner = await action;
+      if (!winner) {
+        // Maybe it opened a menu that needs a second click (CSV/XLS/XLSX)
+        const menuItem = page
+          .locator('[role="menuitem"],[role="option"],.dropdown-item,.menuitem')
+          .filter({ hasText: /excel|csv|xlsx|download/i })
+          .first();
+
+        if (await menuItem.count()) {
+          const twoStep = (async () => {
+            const w = await waitForDownloadAny(page, Math.max(2000, exportTimeout / 2));
+            return w;
+          })();
+          await menuItem.click({ timeout: navTimeout });
+          const w = await twoStep;
+
+          if (w && w.type === 'download') return w;
+        }
+
+        // As a last resort, watch for a late download
+        const late = await page.waitForEvent('download', { timeout: 1500 }).catch(() => null);
+        if (late) return { type: 'download', download: late };
+        return false;
+      }
+
+      return winner;
     } catch (e) {
-      logx(`${label}: click/download failed:`, e?.message || e);
-      return null;
+      console.warn('[EXPORT] tryClickExport error:', e?.message || e);
+      return false;
     }
   };
 
-  // 2) Pass A — global, obvious export controls (don’t scope to results)
-  const globals = []
-    .concat(SELECTORS.ach?.export_buttons || [])
-    .concat(SELECTORS.reporting?.export_buttons || [])
-    .concat([
-      "button.btn.green.export",
-      "a.btn.green.export",
-      "button:has-text('Export')",
-      "a:has-text('Export')",
-      "button:has(i.fa-table)",
-      "a:has(i.fa-table)",
-      "a[href*='/Reporting/ExportReport.aspx']",
-      "[data-url*='/Reporting/ExportReport.aspx']"
-    ]);
-
-  for (const sel of globals) {
-    const loc = page.locator(sel).first();
-    if (await loc.count()) {
-      // If this is a data-url, we’ll handle below; try normal click first.
-      const out = await clickAndDownload(loc, `global ${sel}`);
-      if (out) return out;
+  // 1) Global pass (no scoping)
+  for (const get of globalCandidates) {
+    const loc = get().first();
+    if ((await loc.count()) > 0) {
+      const result = await tryClickExport(loc);
+      if (result && result.type) {
+        if (result.type === 'download') {
+          let suggested = null;
+          try { suggested = await result.download.suggestedFilename(); } catch {}
+          const ext = suggested ? path.extname(suggested) || '.xlsx' : '.xlsx';
+          const outPath = path.join(outDir, `${tagName}${ext}`);
+          await result.download.saveAs(outPath);
+          console.log('[EXPORT] downloaded →', outPath);
+          return outPath;
+        } else if (result.type === 'page' || result.type === 'navigation') {
+          // Page/nav without a “download” event—sometimes it’s a file URL
+          const outPath = path.join(outDir, `${tagName}.html`);
+          await fs.promises.writeFile(outPath, await page.content()).catch(() => {});
+          console.log('[EXPORT] no download event; saved page HTML →', outPath);
+          return outPath;
+        }
+      }
     }
   }
 
-  // 3) Pass B — open dropdown/toggle controls in/near the results portlet,
-  // then retry finding an Export entry in the opened menu(s).
-  const toggles = results.locator([
-    ".portlet-title .actions .dropdown-toggle",
-    ".btn-group > a.dropdown-toggle",
-    "a.inline-dropdown-toggle",
-    "button.dropdown-toggle",
-    ".portlet-title .actions a:has(i.fa-angle-down)",
-    ".portlet-title .actions a:has(i.fa-share)"
-  ].join(', '));
-  const tCount = await toggles.count().catch(() => 0);
-  logx('toggle candidates:', tCount);
+  // 2) Scoped pass (if globals failed)
+  const frames = [page.mainFrame(), ...page.frames()];
+  console.log('[EXPORT] frame list:', frames.map(f => ({ name: f.name(), url: f.url() })));
 
-  for (let i = 0; i < tCount; i++) {
-    const t = toggles.nth(i);
-    try {
-      await t.scrollIntoViewIfNeeded().catch(() => {});
-      await t.click({ timeout: navTimeout });
-      await page.waitForTimeout(200);
-    } catch {}
-    // menus that appear after clicking the toggle
-    const menuExport = page.locator([
-      "ul.dropdown-menu a:has-text('Export')",
-      "ul.inline-dropdown a:has-text('Export')",
-      "ul.dropdown-menu a:has(i.fa-table)",
-      "ul.inline-dropdown a:has(i.fa-table)"
-    ].join(', ')).first();
+  const buttonSelectors = [
+    'button:has-text("Export")',
+    'a:has-text("Export")',
+    '.btn-success:has-text("Export")',
+    '.btn:has-text("Export")',
+    'button:has(i.fa-table), a:has(i.fa-table)',
+  ];
 
-    if (await menuExport.count()) {
-      const out = await clickAndDownload(menuExport, 'menu export');
-      if (out) return out;
+  for (const frame of frames) {
+    for (const scopeSel of scopeSelectors) {
+      const scope = frame.locator(scopeSel);
+      if (!(await scope.count())) continue;
+
+      for (const sel of buttonSelectors) {
+        const loc = scope.locator(sel).first();
+        if (!(await loc.count())) continue;
+
+        const result = await tryClickExport(loc);
+        if (result && result.type) {
+          if (result.type === 'download') {
+            let suggested = null;
+            try { suggested = await result.download.suggestedFilename(); } catch {}
+            const ext = suggested ? path.extname(suggested) || '.xlsx' : '.xlsx';
+            const outPath = path.join(outDir, `${tagName}${ext}`);
+            await result.download.saveAs(outPath);
+            console.log('[EXPORT] downloaded →', outPath);
+            return outPath;
+          } else if (result.type === 'page' || result.type === 'navigation') {
+            const outPath = path.join(outDir, `${tagName}.html`);
+            await fs.promises.writeFile(outPath, await page.content()).catch(() => {});
+            console.log('[EXPORT] no download event; saved page HTML →', outPath);
+            return outPath;
+          }
+        } else {
+          await saveArtifacts(frame, `export-failed-${frames.indexOf(frame)}`);
+        }
+      }
     }
   }
 
-  // 4) Pass C — explicit ExportReport link/data-url inside results subtree
-  const hrefExport = results.locator("a[href*='/Reporting/ExportReport.aspx']").first();
-  if (await hrefExport.count()) {
-    try {
-      const [download] = await Promise.all([
-        page.waitForEvent('download', { timeout: exportTimeout }),
-        hrefExport.click({ timeout: navTimeout })
-      ]);
-      const suggested = await download.suggestedFilename().catch(() => null);
-      const ext = suggested ? (path.extname(suggested) || '.xlsx') : '.xlsx';
-      const outPath = path.join(outDir, `${tagName}${ext}`);
-      await download.saveAs(outPath);
-      logx('href ExportReport →', outPath);
-      return outPath;
-    } catch (e) { logx('href ExportReport failed:', e?.message || e); }
-  }
-
-  const dataUrlNode = results.locator("[data-url*='/Reporting/ExportReport.aspx']").first();
-  if (await dataUrlNode.count()) {
-    const dataUrl = await dataUrlNode.getAttribute('data-url').catch(() => null);
-    if (dataUrl) {
-      const base = env('ELEVATE_BASE', 'https://portal.elevateqs.com');
-      const origin = (() => { try { return new URL(base).origin; } catch { return 'https://portal.elevateqs.com'; } })();
-      const abs = origin + dataUrl;
-      try {
-        const [download] = await Promise.all([
-          page.waitForEvent('download', { timeout: exportTimeout }),
-          page.goto(abs, { timeout: navTimeout, waitUntil: 'domcontentloaded' }).catch(() => {})
-        ]);
-        const suggested = await download.suggestedFilename().catch(() => null);
-        const ext = suggested ? (path.extname(suggested) || '.xlsx') : '.xlsx';
-        const outPath = path.join(outDir, `${tagName}${ext}`);
-        await download.saveAs(outPath);
-        logx('data-url ExportReport →', outPath);
-        return outPath;
-      } catch (e) { logx('data-url ExportReport failed:', e?.message || e); }
-    }
-  }
-
-  throw new Error('ACH export/download control not found after scanning globals, opening dropdowns, and URL fallbacks.');
+  await saveArtifacts(page.mainFrame(), 'export-not-found');
+  throw new Error('Export control not found or did not yield a downloadable file.');
 }
 
 async function searchAndDownloadACH(page, merchant, start, end, outDir) {
