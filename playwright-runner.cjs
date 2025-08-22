@@ -1062,19 +1062,15 @@ async function exportCurrentAch(page, outDir, tag = '') {
   const diagDir       = path.join(ERROR_SHOTS, 'export_diag');
   const tagName       = tag ? `net-ach${tag}` : 'net-ach';
 
-  // ensure dirs
   fs.mkdirSync(outDir, { recursive: true });
   fs.mkdirSync(diagDir, { recursive: true });
 
   const stamp = () => new Date().toISOString().replace(/[:.]/g, '-');
-
-  // local artifacts helper (safe anywhere)
   const saveArtifacts = async (pageOrFrame, label) => {
     try {
       const pg = (pageOrFrame && typeof pageOrFrame.screenshot === 'function')
         ? pageOrFrame
         : (pageOrFrame && typeof pageOrFrame.page === 'function' ? pageOrFrame.page() : page);
-
       const sPath = path.join(diagDir, `${stamp()}-${label}.png`);
       const hPath = path.join(diagDir, `${stamp()}-${label}.html`);
       await pg.screenshot({ path: sPath, fullPage: true }).catch(() => {});
@@ -1083,12 +1079,9 @@ async function exportCurrentAch(page, outDir, tag = '') {
     } catch {}
   };
 
-  // fallback local waitForDownloadAny if a global isn’t present
   const waitForDownloadAnyLocal = async (pg, timeout) => {
     const direct = pg.waitForEvent('download', { timeout })
-      .then(d => ({ type: 'download', download: d }))
-      .catch(() => null);
-
+      .then(d => ({ type: 'download', download: d })).catch(() => null);
     const ctx = pg.context();
     const newPage = ctx.waitForEvent('page', { timeout })
       .then(async p => {
@@ -1098,44 +1091,79 @@ async function exportCurrentAch(page, outDir, tag = '') {
         } catch {
           return { type: 'page', page: p };
         }
-      })
-      .catch(() => null);
-
+      }).catch(() => null);
     const nav = pg.waitForNavigation({ timeout, waitUntil: 'networkidle' })
-      .then(() => ({ type: 'navigation' }))
-      .catch(() => null);
-
+      .then(() => ({ type: 'navigation' })).catch(() => null);
     return Promise.race([direct, newPage, nav].filter(Boolean));
   };
   const waitAny = (typeof waitForDownloadAny === 'function') ? waitForDownloadAny : waitForDownloadAnyLocal;
 
-  // FAST PATH: exact export button (with data-url) present → drive it directly
+  // -------- Phase A: find a data-url Export button in ANY frame ----------
   try {
-    const present = await page
-      .locator('#resultsCont #mainRepHead .btn.green.export[data-url]')
-      .first()
-      .count();
-    if (present) {
-      const filenameBase = tagName;
-      const rel = await page
-        .locator('#resultsCont #mainRepHead .btn.green.export')
-        .first()
-        .getAttribute('data-url');
+    const frames = [page.mainFrame(), ...page.frames()];
+    for (const f of frames) {
+      const btn = f.locator('[data-url*="/Reporting/ExportReport.aspx"]').first();
+      if (await btn.count()) {
+        await btn.waitFor({ state: 'visible', timeout: navTimeout }).catch(()=>{});
+        const rel = await btn.getAttribute('data-url');
+        if (rel) {
+          const origin = new URL(f.url()).origin;
+          const abs = new URL(rel, origin).href;
+          console.log('[EXPORT] fast path (data-url in frame) →', abs);
 
-      if (!rel) throw new Error('Export button missing data-url');
+          const race = (async () => waitAny(page, exportTimeout))();
+          await f.evaluate(u => window.location.assign(u), abs);
+          let res = await race;
 
-      const abs = await page.evaluate(r => new URL(r, window.location.origin).href, rel);
+          if (res && res.type === 'download') {
+            const suggested = await res.download.suggestedFilename().catch(() => null);
+            const ext = suggested ? (path.extname(suggested) || '.xlsx') : '.xlsx';
+            const outPath = path.join(outDir, `${tagName}${ext}`);
+            await res.download.saveAs(outPath);
+            console.log('[EXPORT] downloaded →', outPath);
+            return outPath;
+          }
+
+          const late = await page.waitForEvent('download', { timeout: 1500 }).catch(() => null);
+          if (late) {
+            const suggested = await late.suggestedFilename().catch(() => null);
+            const ext = suggested ? (path.extname(suggested) || '.xlsx') : '.xlsx';
+            const outPath = path.join(outDir, `${tagName}${ext}`);
+            await late.saveAs(outPath);
+            console.log('[EXPORT] late download →', outPath);
+            return outPath;
+          }
+
+          const htmlPath = path.join(outDir, `${tagName}.html`);
+          await fs.promises.writeFile(htmlPath, await page.content()).catch(() => {});
+          console.warn('[EXPORT] no download after data-url nav; saved HTML →', htmlPath);
+          return htmlPath;
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('[EXPORT] data-url fast path scan failed:', e?.message || e);
+  }
+
+  // -------- Phase B: derive ExportReport URL from current location --------
+  try {
+    const cur = new URL(page.url());
+    if (/\/Reporting\/Report\.aspx$/i.test(cur.pathname)) {
+      cur.pathname = '/Reporting/ExportReport.aspx';
+      cur.searchParams.set('_', String(Date.now()));
+      const exportHref = cur.href;
+      console.log('[EXPORT] derived export URL →', exportHref);
 
       const race = (async () => waitAny(page, exportTimeout))();
-      await page.evaluate(url => { window.location.assign(url); }, abs);
-      let result = await race;
+      await page.evaluate(u => window.location.assign(u), exportHref);
+      let res = await race;
 
-      if (result && result.type === 'download') {
-        const suggested = await result.download.suggestedFilename().catch(() => null);
+      if (res && res.type === 'download') {
+        const suggested = await res.download.suggestedFilename().catch(() => null);
         const ext = suggested ? (path.extname(suggested) || '.xlsx') : '.xlsx';
-        const outPath = path.join(outDir, `${filenameBase}${ext}`);
-        await result.download.saveAs(outPath);
-        console.log('[EXPORT] downloaded →', outPath);
+        const outPath = path.join(outDir, `${tagName}${ext}`);
+        await res.download.saveAs(outPath);
+        console.log('[EXPORT] downloaded (derived) →', outPath);
         return outPath;
       }
 
@@ -1143,26 +1171,23 @@ async function exportCurrentAch(page, outDir, tag = '') {
       if (late) {
         const suggested = await late.suggestedFilename().catch(() => null);
         const ext = suggested ? (path.extname(suggested) || '.xlsx') : '.xlsx';
-        const outPath = path.join(outDir, `${filenameBase}${ext}`);
+        const outPath = path.join(outDir, `${tagName}${ext}`);
         await late.saveAs(outPath);
-        console.log('[EXPORT] late download →', outPath);
+        console.log('[EXPORT] late download (derived) →', outPath);
         return outPath;
       }
 
-      // Fallback: keep HTML (helps you see what server returned)
-      const htmlPath = path.join(outDir, `${filenameBase}.html`);
+      const htmlPath = path.join(outDir, `${tagName}.html`);
       await fs.promises.writeFile(htmlPath, await page.content()).catch(() => {});
-      console.warn('[EXPORT] no download event; saved HTML →', htmlPath);
+      console.warn('[EXPORT] no download after derived nav; saved HTML →', htmlPath);
       return htmlPath;
     }
   } catch (e) {
-    console.warn('[EXPORT] data-url fast path failed:', e?.message || e);
-    // fall through to generic hunter
+    console.warn('[EXPORT] URL-derivation failed:', e?.message || e);
   }
 
-  // ===== Generic hunter (global → scoped) ===================================
+  // -------- Phase C: generic hunter (global → frames) ----------------------
   const hasGetByRole = typeof page.getByRole === 'function';
-
   const globalCandidates = [
     () => hasGetByRole ? page.getByRole('button', { name: /export|download/i }) : page.locator('button,[role="button"]').filter({ hasText: /export|download/i }),
     () => hasGetByRole ? page.getByRole('link',   { name: /export|download/i }) : page.locator('a,[role="link"]').filter({ hasText: /export|download/i }),
@@ -1172,15 +1197,13 @@ async function exportCurrentAch(page, outDir, tag = '') {
     () => page.locator('.btn:has-text("Export")'),
     () => page.locator('button:has(i.fa-table), a:has(i.fa-table)'),
   ];
-
   const scopeSelectors = [
-    'section:has-text("Report Results")',  // note case
+    'section:has-text("Report Results")',
     'div.card:has-text("Report Results")',
     'div.panel:has-text("Report Results")',
     'main',
     'body',
   ];
-
   const buttonSelectors = [
     'button:has-text("Export")',
     'a:has-text("Export")',
@@ -1192,7 +1215,6 @@ async function exportCurrentAch(page, outDir, tag = '') {
   const tryClickExport = async (target) => {
     try {
       await target.waitFor({ state: 'attached', timeout: appearTimeout });
-
       const vis = await target.isVisible().catch(() => false);
       if (!vis) await target.scrollIntoViewIfNeeded().catch(() => {});
       const enabled = await target.isEnabled().catch(() => false);
@@ -1250,7 +1272,7 @@ async function exportCurrentAch(page, outDir, tag = '') {
     }
   }
 
-  // Pass 2: scoped across frames
+  // Pass 2: frames × scopes
   const frames = [page.mainFrame(), ...page.frames()];
   console.log('[EXPORT] frame list:', frames.map(f => ({ name: f.name(), url: f.url() })));
   for (const frame of frames) {
@@ -1284,11 +1306,9 @@ async function exportCurrentAch(page, outDir, tag = '') {
     }
   }
 
-  // Nothing worked
   await saveArtifacts(page, 'export-not-found');
   throw new Error('Export control not found or did not yield a downloadable file.');
 }
-
 
 async function searchAndDownloadACH(page, merchant, start, end, outDir) {
   const ach = SELECTORS.ach || {};
