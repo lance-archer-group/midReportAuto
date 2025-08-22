@@ -944,23 +944,19 @@ async function addMidsToAchReport(page, mids) {
 }
 
 // Export (bulk) with deep diagnostics
-// replace your entire exportCurrentAch() with this version
-import path from 'path';
-import fs from 'fs';
-
-// Helper: robust wait for a download (or a new page that triggers one)
-async function waitForDownloadAny(page: import('@playwright/test').Page, exportTimeout: number) {
-  // 1) direct download
+// ===== Export helpers (CJS-safe) ============================================
+// ANCHOR: waitForDownloadAny
+async function waitForDownloadAny(page, exportTimeout) {
+  // 1) direct download on the same page
   const direct = page.waitForEvent('download', { timeout: exportTimeout })
     .then(d => ({ type: 'download', download: d }))
     .catch(() => null);
 
-  // 2) a new page opens and triggers a download
+  // 2) new page opens and triggers a download
   const ctx = page.context();
   const newPage = ctx.waitForEvent('page', { timeout: exportTimeout })
     .then(async p => {
       try {
-        // if the new page triggers a download right away
         const dl = await p.waitForEvent('download', { timeout: Math.max(1000, exportTimeout / 2) });
         return { type: 'download', download: dl };
       } catch {
@@ -969,16 +965,17 @@ async function waitForDownloadAny(page: import('@playwright/test').Page, exportT
     })
     .catch(() => null);
 
-  // 3) same page navigates to a file (some apps do this)
+  // 3) same page navigates to a file (no 'download' event)
   const nav = page.waitForNavigation({ timeout: exportTimeout, waitUntil: 'networkidle' })
     .then(() => ({ type: 'navigation' }))
     .catch(() => null);
 
-  const winner = await Promise.race([direct, newPage, nav].filter(Boolean) as any[]);
+  const winner = await Promise.race([direct, newPage, nav].filter(Boolean));
   return winner;
 }
 
-export async function exportCurrentAch(page, outDir, tag = '') {
+// ANCHOR: exportCurrentAch
+async function exportCurrentAch(page, outDir, tag = '') {
   const navTimeout    = numEnv('NAV_TIMEOUT_MS', 15000);
   const appearTimeout = numEnv('EXPORT_BUTTON_APPEAR_MS', 8000);
   const exportTimeout = numEnv('EXPORT_TIMEOUT_MS', 60000);
@@ -991,7 +988,7 @@ export async function exportCurrentAch(page, outDir, tag = '') {
   const stamp = () => new Date().toISOString().replace(/[:.]/g, '-');
   const saveArtifacts = async (frameLike, label) => {
     try {
-      const pg = 'page' in frameLike ? frameLike.page() : page;
+      const pg = (frameLike && typeof frameLike.page === 'function') ? frameLike.page() : page;
       const sPath = path.join(diagDir, `${stamp()}-${label}.png`);
       const hPath = path.join(diagDir, `${stamp()}-${label}.html`);
       await pg.screenshot({ path: sPath, fullPage: true }).catch(() => {});
@@ -1000,12 +997,12 @@ export async function exportCurrentAch(page, outDir, tag = '') {
     } catch {}
   };
 
-  // Candidates we’ll try globally first (best → looser)
+  // Prefer role-based queries if available (Playwright >=1.27). Fallback provided.
+  const hasGetByRole = typeof page.getByRole === 'function';
+
   const globalCandidates = [
-    // role-based is strongest
-    () => page.getByRole('button', { name: /export|download/i }),
-    () => page.getByRole('link', { name: /export|download/i }),
-    // fallback CSS/text combos
+    () => hasGetByRole ? page.getByRole('button', { name: /export|download/i }) : page.locator('button,[role="button"]').filter({ hasText: /export|download/i }),
+    () => hasGetByRole ? page.getByRole('link',   { name: /export|download/i }) : page.locator('a,[role="link"]').filter({ hasText: /export|download/i }),
     () => page.locator('button:has-text("Export")'),
     () => page.locator('a:has-text("Export")'),
     () => page.locator('.btn-success:has-text("Export")'),
@@ -1013,7 +1010,6 @@ export async function exportCurrentAch(page, outDir, tag = '') {
     () => page.locator('button:has(i.fa-table), a:has(i.fa-table)'),
   ];
 
-  // Scopes to try *if* the global pass finds nothing
   const scopeSelectors = [
     'section:has-text("REPORT RESULTS")',
     'div.card:has-text("REPORT RESULTS")',
@@ -1022,62 +1018,59 @@ export async function exportCurrentAch(page, outDir, tag = '') {
     'body',
   ];
 
-  // A helper to click an export target (single click or button→menu)
+  const buttonSelectors = [
+    'button:has-text("Export")',
+    'a:has-text("Export")',
+    '.btn-success:has-text("Export")',
+    '.btn:has-text("Export")',
+    'button:has(i.fa-table), a:has(i.fa-table)',
+  ];
+
   const tryClickExport = async (target) => {
     try {
       await target.waitFor({ state: 'attached', timeout: appearTimeout });
 
-      // If the element exists but is not usable, bail
-      if (!(await target.isVisible({ timeout: 250 }).catch(() => false))) {
-        // sometimes offscreen; try scroll
-        await target.scrollIntoViewIfNeeded().catch(() => {});
-      }
-      // Enabled check covers aria-disabled etc.
-      if (!(await target.isEnabled({ timeout: 250 }).catch(() => false))) {
-        return false;
-      }
+      // Try to make it interactable
+      const vis = await target.isVisible().catch(() => false);
+      if (!vis) await target.scrollIntoViewIfNeeded().catch(() => {});
+      const enabled = await target.isEnabled().catch(() => false);
+      if (!enabled) return false;
 
-      // Attempt: simple one-click download or open menu
-      const action = (async () => {
-        const winner = await waitForDownloadAny(page, exportTimeout);
-        return winner;
-      })();
+      // Start download race *before* clicking
+      const waitWinner = (async () => waitForDownloadAny(page, exportTimeout))();
 
       await target.click({ timeout: navTimeout });
 
-      const winner = await action;
+      let winner = await waitWinner;
+
+      // Maybe it opened a menu, click a CSV/Excel option
       if (!winner) {
-        // Maybe it opened a menu that needs a second click (CSV/XLS/XLSX)
         const menuItem = page
           .locator('[role="menuitem"],[role="option"],.dropdown-item,.menuitem')
           .filter({ hasText: /excel|csv|xlsx|download/i })
           .first();
 
         if (await menuItem.count()) {
-          const twoStep = (async () => {
-            const w = await waitForDownloadAny(page, Math.max(2000, exportTimeout / 2));
-            return w;
-          })();
-          await menuItem.click({ timeout: navTimeout });
-          const w = await twoStep;
-
-          if (w && w.type === 'download') return w;
+          const afterMenu = (async () => waitForDownloadAny(page, Math.max(2000, exportTimeout / 2)))();
+          try { await menuItem.click({ timeout: navTimeout }); } catch {}
+          winner = await afterMenu;
         }
-
-        // As a last resort, watch for a late download
-        const late = await page.waitForEvent('download', { timeout: 1500 }).catch(() => null);
-        if (late) return { type: 'download', download: late };
-        return false;
       }
 
-      return winner;
+      // Late download event
+      if (!winner) {
+        const late = await page.waitForEvent('download', { timeout: 1500 }).catch(() => null);
+        if (late) winner = { type: 'download', download: late };
+      }
+
+      return winner || false;
     } catch (e) {
       console.warn('[EXPORT] tryClickExport error:', e?.message || e);
       return false;
     }
   };
 
-  // 1) Global pass (no scoping)
+  // Pass 1: global scan (no scoping)
   for (const get of globalCandidates) {
     const loc = get().first();
     if ((await loc.count()) > 0) {
@@ -1086,13 +1079,12 @@ export async function exportCurrentAch(page, outDir, tag = '') {
         if (result.type === 'download') {
           let suggested = null;
           try { suggested = await result.download.suggestedFilename(); } catch {}
-          const ext = suggested ? path.extname(suggested) || '.xlsx' : '.xlsx';
+          const ext = suggested ? (path.extname(suggested) || '.xlsx') : '.xlsx';
           const outPath = path.join(outDir, `${tagName}${ext}`);
           await result.download.saveAs(outPath);
           console.log('[EXPORT] downloaded →', outPath);
           return outPath;
-        } else if (result.type === 'page' || result.type === 'navigation') {
-          // Page/nav without a “download” event—sometimes it’s a file URL
+        } else {
           const outPath = path.join(outDir, `${tagName}.html`);
           await fs.promises.writeFile(outPath, await page.content()).catch(() => {});
           console.log('[EXPORT] no download event; saved page HTML →', outPath);
@@ -1102,17 +1094,9 @@ export async function exportCurrentAch(page, outDir, tag = '') {
     }
   }
 
-  // 2) Scoped pass (if globals failed)
+  // Pass 2: scoped scan (frames × scopes × selectors)
   const frames = [page.mainFrame(), ...page.frames()];
   console.log('[EXPORT] frame list:', frames.map(f => ({ name: f.name(), url: f.url() })));
-
-  const buttonSelectors = [
-    'button:has-text("Export")',
-    'a:has-text("Export")',
-    '.btn-success:has-text("Export")',
-    '.btn:has-text("Export")',
-    'button:has(i.fa-table), a:has(i.fa-table)',
-  ];
 
   for (const frame of frames) {
     for (const scopeSel of scopeSelectors) {
@@ -1128,12 +1112,12 @@ export async function exportCurrentAch(page, outDir, tag = '') {
           if (result.type === 'download') {
             let suggested = null;
             try { suggested = await result.download.suggestedFilename(); } catch {}
-            const ext = suggested ? path.extname(suggested) || '.xlsx' : '.xlsx';
+            const ext = suggested ? (path.extname(suggested) || '.xlsx') : '.xlsx';
             const outPath = path.join(outDir, `${tagName}${ext}`);
             await result.download.saveAs(outPath);
             console.log('[EXPORT] downloaded →', outPath);
             return outPath;
-          } else if (result.type === 'page' || result.type === 'navigation') {
+          } else {
             const outPath = path.join(outDir, `${tagName}.html`);
             await fs.promises.writeFile(outPath, await page.content()).catch(() => {});
             console.log('[EXPORT] no download event; saved page HTML →', outPath);
@@ -1149,6 +1133,7 @@ export async function exportCurrentAch(page, outDir, tag = '') {
   await saveArtifacts(page.mainFrame(), 'export-not-found');
   throw new Error('Export control not found or did not yield a downloadable file.');
 }
+
 
 async function searchAndDownloadACH(page, merchant, start, end, outDir) {
   const ach = SELECTORS.ach || {};
