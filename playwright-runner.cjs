@@ -845,6 +845,20 @@ async function main() {
     console.log('[export] exporting…');
     const outPath = await exportCombined(page, dayDir, `net-ach-${startStr}-${endStr}`);
     console.log('[export] saved →', outPath);
+    // --- Email the export (best-effort) -----------------------------------------
+try {
+  if (process.env.EMAIL_TO) {
+    await emailReport(outPath, {
+      subject: process.env.EMAIL_SUBJECT || `Net ACH Export ${dayFolderName}`,
+      text: process.env.EMAIL_BODY || `Attached is the Net ACH export for ${startStr} → ${endStr}.`,
+      filename: path.basename(outPath),
+    });
+  } else {
+    console.log('[EMAIL] EMAIL_TO not set — skipping send.');
+  }
+} catch (e) {
+  console.warn('[EMAIL] send failed:', e?.message || e);
+}
   } catch (e) {
     console.error('[run] failed:', e?.message || e);
     await saveArtifacts(page, 'fatal', path.join(ERROR_SHOTS, 'fatal'));
