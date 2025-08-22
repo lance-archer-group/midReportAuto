@@ -28,8 +28,87 @@ function numEnv(key, fallback) {
   const v = Number(process.env[key]);
   return Number.isFinite(v) ? v : fallback;
 }
+async function exportViaDataUrl(page, outDir, filenameBase = 'net-ach') {
+  const navTimeout    = numEnv('NAV_TIMEOUT_MS', 15000);
+  const exportTimeout = numEnv('EXPORT_TIMEOUT_MS', 60000);
+
+  // Ensure results rendered
+  await page.locator('#resultsCont #mainRepHead').waitFor({ state: 'attached', timeout: navTimeout }).catch(() => {});
+
+  const btn = page.locator('#resultsCont #mainRepHead .btn.green.export[data-url]').first();
+  await btn.waitFor({ state: 'visible', timeout: navTimeout });
+
+  const rel = await btn.getAttribute('data-url');
+  if (!rel) throw new Error('Export button missing data-url');
+
+  const abs = await page.evaluate((r) => new URL(r, window.location.origin).href, rel);
+
+  const race = (async () => {
+    const direct = page.waitForEvent('download', { timeout: exportTimeout })
+      .then(d => ({ type: 'download', download: d }))
+      .catch(() => null);
+    const nav = page.waitForNavigation({ timeout: exportTimeout, waitUntil: 'networkidle' })
+      .then(() => ({ type: 'navigation' }))
+      .catch(() => null);
+    return Promise.race([direct, nav]);
+  })();
+
+  // Navigate to the export endpoint without relying on JS click handlers
+  await page.evaluate((url) => { window.location.assign(url); }, abs);
+
+  let result = await race;
+
+  if (result && result.type === 'download') {
+    let suggested = null;
+    try { suggested = await result.download.suggestedFilename(); } catch {}
+    const ext = suggested ? (path.extname(suggested) || '.xlsx') : '.xlsx';
+    const outPath = path.join(outDir, `${filenameBase}${ext}`);
+    await result.download.saveAs(outPath);
+    console.log('[EXPORT] downloaded →', outPath);
+    return outPath;
+  }
+
+  // Late fire: some flows trigger download after the navigation settles
+  const late = await page.waitForEvent('download', { timeout: 1500 }).catch(() => null);
+  if (late) {
+    const suggested = await late.suggestedFilename().catch(() => null);
+    const ext = suggested ? (path.extname(suggested) || '.xlsx') : '.xlsx';
+    const outPath = path.join(outDir, `${filenameBase}${ext}`);
+    await late.saveAs(outPath);
+    console.log('[EXPORT] late download →', outPath);
+    return outPath;
+  }
+
+  // Fallback: save HTML so you can see what the server returned
+  const htmlPath = path.join(outDir, `${filenameBase}.html`);
+  await fs.promises.writeFile(htmlPath, await page.content()).catch(() => {});
+  console.warn('[EXPORT] no download event; saved HTML →', htmlPath);
+  return htmlPath;
+}
 // ===== Email helper ==========================================================
 const nodemailer = require('nodemailer');
+// ===== Diagnostics (global) ==================================================
+async function saveArtifacts(pageOrFrame, label) {
+  try {
+    const diagDir = path.join(ERROR_SHOTS, 'export_diag');
+    fs.mkdirSync(diagDir, { recursive: true });
+
+    const stamp = () => new Date().toISOString().replace(/[:.]/g, '-');
+    const pageObj = (pageOrFrame && typeof pageOrFrame.screenshot === 'function')
+      ? pageOrFrame
+      : (pageOrFrame && typeof pageOrFrame.page === 'function'
+          ? pageOrFrame.page()
+          : null);
+
+    if (!pageObj) return;
+
+    const sPath = path.join(diagDir, `${stamp()}-${label}.png`);
+    const hPath = path.join(diagDir, `${stamp()}-${label}.html`);
+    await pageObj.screenshot({ path: sPath, fullPage: true }).catch(() => {});
+    await fs.promises.writeFile(hPath, await pageObj.content()).catch(() => {});
+    console.log('[ARTIFACTS]', sPath, '|', hPath);
+  } catch {}
+}
 
 /**
  * Email a file attachment (the single combined export).
@@ -982,12 +1061,13 @@ async function exportCurrentAch(page, outDir, tag = '') {
   const diagDir       = path.join(ERROR_SHOTS, 'export_diag');
   const tagName       = tag ? `net-ach${tag}` : 'net-ach';
 try {
-  const exists = await page.locator('#resultsCont #mainRepHead .btn.green.export[data-url]').first().count();
-  if (exists) {
-    const baseTag = tag ? `net-ach${tag}` : 'net-ach';
-    return await exportViaDataUrl(page, outDir, baseTag);
-  }
-} catch (_){
+    const present = await page.locator('#resultsCont #mainRepHead .btn.green.export[data-url]').first().count();
+    if (present) {
+      const baseTag = tag ? `net-ach${tag}` : 'net-ach';
+      return await exportViaDataUrl(page, outDir, baseTag);
+    }
+  } catch (e) {
+    console.warn('[EXPORT] data-url fast path failed:', e?.message || e);
   fs.mkdirSync(outDir, { recursive: true });
   fs.mkdirSync(diagDir, { recursive: true });
 
