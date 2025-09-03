@@ -60,7 +60,37 @@ function fmtMMDDYYYY(d) {
     .formatToParts(d).reduce((o, p) => (o[p.type] = p.value, o), {});
   return `${parts.month}/${parts.day}/${parts.year}`;
 }
+// Simple NY date stamp for filenames: 2025-09-02
+function fmtYYYY_MM_DD(d) {
+  const { y, m, d:dd } = nyParts(d);
+  const pad = (n) => String(n).padStart(2,'0');
+  return `${y}-${pad(m)}-${pad(dd)}`;
+}
 
+// Human subject like:
+// "Sep 2, 2025"        (same day)
+// "Sep 1–2, 2025"      (same month/year)
+// "Aug 31 – Sep 2, 2025" (same year, diff month)
+// "Dec 31, 2024 – Jan 2, 2025" (diff year)
+function humanRange(start, end) {
+  const optsMDY = { timeZone: DATE_TZ, year: 'numeric', month: 'short', day: 'numeric' };
+  const optsMD  = { timeZone: DATE_TZ, month: 'short', day: 'numeric' };
+  const yS = new Intl.DateTimeFormat('en-US', { timeZone: DATE_TZ, year: 'numeric' }).format(start);
+  const yE = new Intl.DateTimeFormat('en-US', { timeZone: DATE_TZ, year: 'numeric' }).format(end);
+  const mS = new Intl.DateTimeFormat('en-US', { timeZone: DATE_TZ, month: 'short' }).format(start);
+  const mE = new Intl.DateTimeFormat('en-US', { timeZone: DATE_TZ, month: 'short' }).format(end);
+  const dS = new Intl.DateTimeFormat('en-US', { timeZone: DATE_TZ, day: 'numeric' }).format(start);
+  const dE = new Intl.DateTimeFormat('en-US', { timeZone: DATE_TZ, day: 'numeric' }).format(end);
+
+  const sameDay = +nyStartOfDay(start) === +nyStartOfDay(end);
+  const sameYear = yS === yE;
+  const sameMonth = sameYear && mS === mE;
+
+  if (sameDay) return new Intl.DateTimeFormat('en-US', optsMDY).format(start);
+  if (sameMonth) return `${mS} ${dS}–${dE}, ${yS}`;
+  if (sameYear) return `${new Intl.DateTimeFormat('en-US', optsMD).format(start)} – ${new Intl.DateTimeFormat('en-US', optsMD).format(end)}, ${yS}`;
+  return `${new Intl.DateTimeFormat('en-US', optsMDY).format(start)} – ${new Intl.DateTimeFormat('en-US', optsMDY).format(end)}`;
+}
 // ===== nav-race guard helpers ================================================
 function isNavRace(err) {
   const s = String(err || '');
@@ -642,15 +672,13 @@ async function exportCombined(page, outDir, baseName = 'net-ach') {
         await f.evaluate(u => window.location.assign(u), abs);
         const res = await race;
         if (res?.kind === 'download') {
-          let suggested = null; try { suggested = res.d.suggestedFilename(); } catch {}
-          const out = path.join(outDir, suggested || `${baseName}.xlsx`);
+         const out = path.join(outDir, `${baseName}.xlsx`);
           await res.d.saveAs(out);
           return out;
         }
         const late = await page.waitForEvent('download', { timeout: 1500 }).catch(()=>null);
         if (late) {
-          let suggested = null; try { suggested = late.suggestedFilename(); } catch {}
-          const out = path.join(outDir, suggested || `${baseName}.xlsx`);
+         const out = path.join(outDir, `${baseName}.xlsx`);
           await late.saveAs(out);
           return out;
         }
@@ -668,15 +696,13 @@ async function exportCombined(page, outDir, baseName = 'net-ach') {
     await page.evaluate(u => window.location.assign(u), href);
     const res = await race;
     if (res?.kind === 'download') {
-      let suggested = null; try { suggested = res.d.suggestedFilename(); } catch {}
-      const out = path.join(outDir, suggested || `${baseName}.xlsx`);
+      const out = path.join(outDir, `${baseName}.xlsx`);
       await res.d.saveAs(out);
       return out;
     }
     const late = await page.waitForEvent('download', { timeout: 1500 }).catch(()=>null);
     if (late) {
-      let suggested = null; try { suggested = late.suggestedFilename(); } catch {}
-      const out = path.join(outDir, suggested || `${baseName}.xlsx`);
+      const out = path.join(outDir, `${baseName}.xlsx`);
       await late.saveAs(out);
       return out;
     }
@@ -689,8 +715,7 @@ async function exportCombined(page, outDir, baseName = 'net-ach') {
     await expBtn.click().catch(()=>{});
     const res = await race;
     if (res?.kind === 'download') {
-      let suggested = null; try { suggested = res.d.suggestedFilename(); } catch {}
-      const out = path.join(outDir, suggested || `${baseName}.xlsx`);
+      const out = path.join(outDir, `${baseName}.xlsx`);
       await res.d.saveAs(out);
       return out;
     }
@@ -747,7 +772,13 @@ async function main() {
   console.log(`Node: ${process.version} (${process.platform} ${process.arch})`);
   console.log(`CWD: ${process.cwd()}`);
   console.log(`Start: ${new Date().toISOString()}`);
+const startSafe = fmtYYYY_MM_DD(start);
+const endSafe   = fmtYYYY_MM_DD(end);
+const fileBase  = ( +nyStartOfDay(start) === +nyStartOfDay(end) )
+  ? `net-ach-${startSafe}`
+  : `net-ach-${startSafe}_to_${endSafe}`;
 
+const subjectLine = `Net ACH Export — ${humanRange(start, end)}`;
   // output paths
   fs.mkdirSync(OUT_ROOT, { recursive: true });
   fs.mkdirSync(ERROR_SHOTS, { recursive: true });
@@ -901,13 +932,13 @@ async function main() {
 
     // 7) export
     console.log('[export] exporting…');
-    const outPath = await exportCombined(page, dayDir, `net-ach-${startStr}-${endStr}`);
+    const outPath = await exportCombined(page, dayDir, fileBase);
     console.log('[export] saved →', outPath);
     // --- Email the export (best-effort) -----------------------------------------
 try {
   if (process.env.EMAIL_TO) {
     await emailReport(outPath, {
-      subject: process.env.EMAIL_SUBJECT || `Net ACH Export ${dayFolderName}`,
+      subject: process.env.EMAIL_SUBJECT || subjectLine,
       text: process.env.EMAIL_BODY || `Attached is the Net ACH export for ${startStr} → ${endStr}.`,
       filename: path.basename(outPath),
     });
