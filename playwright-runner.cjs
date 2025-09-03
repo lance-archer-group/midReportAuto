@@ -36,12 +36,43 @@ function nyStartOfDay(date) {
   const { y, m, d } = nyParts(date);
   return new Date(Date.UTC(y, m - 1, d, 5, 0, 0)); // 00:00 NY ≈ 05:00 UTC
 }
-function defaultRange() {
-  const mode = env('DATE_MODE', 'yesterday').toLowerCase();
-  const todayNY = nyStartOfDay(new Date());
+function defaultRange(mode = env('DATE_MODE', 'yesterday').toLowerCase()) {
+  const todayNY = nyStartOfDay(new Date()); // 00:00 NY
   const start = new Date(todayNY);
-  if (mode === 'yesterday') start.setUTCDate(start.getUTCDate() - 1);
-  return { start, end: start };
+  const end   = new Date(todayNY);
+
+  switch (mode) {
+    case 'today':
+      return { start, end };                         // today → today
+    case 'yesterday':
+      start.setUTCDate(start.getUTCDate() - 1);      // yesterday → yesterday
+      end.setUTCDate(end.getUTCDate() - 1);
+      return { start, end };
+    case 'yesterday_to_today':
+    case 'y2t':
+      start.setUTCDate(start.getUTCDate() - 1);      // yesterday → today
+      return { start, end };
+    default:
+      // fallback to yesterday (old default)
+      start.setUTCDate(start.getUTCDate() - 1);
+      end.setUTCDate(end.getUTCDate() - 1);
+      return { start, end };
+  }
+}
+
+function parseRangeFromEnv() {
+  // If FORCE_DATE_MODE=true, ignore START/END entirely
+  const forceMode = /^(1|true|yes|on)$/i.test(env('FORCE_DATE_MODE',''));
+  const s = env('START', '');
+  const e = env('END', '');
+  if (!forceMode && (s || e)) {
+    const S = s ? new Date(s) : new Date();
+    const E = e ? new Date(e) : S;
+    if (isNaN(+S)) throw new Error(`Invalid START date: ${s}`);
+    if (isNaN(+E)) throw new Error(`Invalid END date: ${e}`);
+    return { start: S, end: E };
+  }
+  return defaultRange();
 }
 function parseRangeFromEnv() {
   const s = env('START', '');
