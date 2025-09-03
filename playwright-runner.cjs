@@ -72,25 +72,7 @@ function fmtYYYY_MM_DD(d) {
 // "Sep 1–2, 2025"      (same month/year)
 // "Aug 31 – Sep 2, 2025" (same year, diff month)
 // "Dec 31, 2024 – Jan 2, 2025" (diff year)
-function humanRange(start, end) {
-  const optsMDY = { timeZone: DATE_TZ, year: 'numeric', month: 'short', day: 'numeric' };
-  const optsMD  = { timeZone: DATE_TZ, month: 'short', day: 'numeric' };
-  const yS = new Intl.DateTimeFormat('en-US', { timeZone: DATE_TZ, year: 'numeric' }).format(start);
-  const yE = new Intl.DateTimeFormat('en-US', { timeZone: DATE_TZ, year: 'numeric' }).format(end);
-  const mS = new Intl.DateTimeFormat('en-US', { timeZone: DATE_TZ, month: 'short' }).format(start);
-  const mE = new Intl.DateTimeFormat('en-US', { timeZone: DATE_TZ, month: 'short' }).format(end);
-  const dS = new Intl.DateTimeFormat('en-US', { timeZone: DATE_TZ, day: 'numeric' }).format(start);
-  const dE = new Intl.DateTimeFormat('en-US', { timeZone: DATE_TZ, day: 'numeric' }).format(end);
 
-  const sameDay = +nyStartOfDay(start) === +nyStartOfDay(end);
-  const sameYear = yS === yE;
-  const sameMonth = sameYear && mS === mE;
-
-  if (sameDay) return new Intl.DateTimeFormat('en-US', optsMDY).format(start);
-  if (sameMonth) return `${mS} ${dS}–${dE}, ${yS}`;
-  if (sameYear) return `${new Intl.DateTimeFormat('en-US', optsMD).format(start)} – ${new Intl.DateTimeFormat('en-US', optsMD).format(end)}, ${yS}`;
-  return `${new Intl.DateTimeFormat('en-US', optsMDY).format(start)} – ${new Intl.DateTimeFormat('en-US', optsMDY).format(end)}`;
-}
 // ===== nav-race guard helpers ================================================
 function isNavRace(err) {
   const s = String(err || '');
@@ -768,12 +750,39 @@ async function saveArtifacts(page, label, diagDir) {
 
 // ===== main run ==============================================================
 async function main() {
+  const { start, end } = parseRangeFromEnv();
   console.log('▶️  Net ACH Export (Node) starting');
   console.log(`Node: ${process.version} (${process.platform} ${process.arch})`);
   console.log(`CWD: ${process.cwd()}`);
   console.log(`Start: ${new Date().toISOString()}`);
 const startSafe = fmtYYYY_MM_DD(start);
 const endSafe   = fmtYYYY_MM_DD(end);
+function humanRange(start, end) {
+  const sameDay = +nyStartOfDay(start) === +nyStartOfDay(end);
+
+  const fmtMDY = new Intl.DateTimeFormat('en-US', {
+    timeZone: DATE_TZ, year: 'numeric', month: 'short', day: 'numeric'
+  });
+  const fmtMD = new Intl.DateTimeFormat('en-US', {
+    timeZone: DATE_TZ, month: 'short', day: 'numeric'
+  });
+  const fmtY = new Intl.DateTimeFormat('en-US', { timeZone: DATE_TZ, year: 'numeric' });
+  const fmtM = new Intl.DateTimeFormat('en-US', { timeZone: DATE_TZ, month: 'short' });
+  const fmtD = new Intl.DateTimeFormat('en-US', { timeZone: DATE_TZ, day: 'numeric' });
+
+  if (sameDay) return fmtMDY.format(start);
+
+  const yS = fmtY.format(start), yE = fmtY.format(end);
+  const mS = fmtM.format(start), mE = fmtM.format(end);
+  const dS = fmtD.format(start), dE = fmtD.format(end);
+
+  const sameYear = yS === yE;
+  const sameMonth = sameYear && mS === mE;
+
+  if (sameMonth) return `${mS} ${dS}–${dE}, ${yS}`;
+  if (sameYear)  return `${fmtMD.format(start)} – ${fmtMD.format(end)}, ${yS}`;
+  return `${fmtMDY.format(start)} – ${fmtMDY.format(end)}`;
+}
 const fileBase  = ( +nyStartOfDay(start) === +nyStartOfDay(end) )
   ? `net-ach-${startSafe}`
   : `net-ach-${startSafe}_to_${endSafe}`;
@@ -783,7 +792,7 @@ const subjectLine = `Net ACH Export — ${humanRange(start, end)}`;
   fs.mkdirSync(OUT_ROOT, { recursive: true });
   fs.mkdirSync(ERROR_SHOTS, { recursive: true });
 
-  const { start, end } = parseRangeFromEnv();
+
   const dayFolderName = new Intl.DateTimeFormat('en-CA', { timeZone: DATE_TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(start);
   const dayDir = path.join(OUT_ROOT, dayFolderName);
   fs.mkdirSync(dayDir, { recursive: true });
