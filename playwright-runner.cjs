@@ -947,7 +947,7 @@ const subjectLine = `Net ACH Export — ${humanRange(start, end)}`;
 try {
   if (process.env.EMAIL_TO) {
     await emailReport(outPath, {
-      subject: process.env.EMAIL_SUBJECT || subjectLine,
+      subject: subjectLine,
       text: process.env.EMAIL_BODY || `Attached is the Net ACH export for ${startStr} → ${endStr}.`,
       filename: path.basename(outPath),
     });
