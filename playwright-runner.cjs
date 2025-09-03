@@ -183,7 +183,10 @@ async function emailReport(fileArg, overrides = {}) {
   }
 }
 // ===== IMAP 2FA helpers ======================================================
-async function get2faCodeFromImap() {
+async function get2faCodeFromImap(opts = {}) {
+  const notBefore = opts.notBefore ? +new Date(opts.notBefore) : null;
+  const markSeen  = /^(1|true|yes|on)$/i.test(env('IMAP_MARK_SEEN_AFTER',''));
+
   const host   = env('IMAP_HOST', 'imap.gmail.com');
   const port   = numEnv('IMAP_PORT', 993);
   const secure = bool(env('IMAP_SECURE', 'true'), true);
@@ -191,13 +194,12 @@ async function get2faCodeFromImap() {
   const pass   = env('IMAP_PASS');
   if (!user || !pass) throw new Error('IMAP_USER/IMAP_PASS not set');
 
-  const mailboxCsv = env('IMAP_MAILBOXES', env('IMAP_MAILBOX', 'INBOX'));
-  const mailboxes  = mailboxCsv.split(',').map(s => s.trim()).filter(Boolean);
+  const mailboxCsv  = env('IMAP_MAILBOXES', env('IMAP_MAILBOX', 'INBOX'));
+  const mailboxes   = mailboxCsv.split(',').map(s => s.trim()).filter(Boolean);
   const subjectFilt = env('IMAP_SUBJECT_FILTER', 'Elevate MFA Code');
   const fromFilter  = env('IMAP_FROM_FILTER', '');
   const lookbackMin = numEnv('IMAP_LOOKBACK_MINUTES', 60);
   const onlyUnseen  = bool(env('IMAP_ONLY_UNSEEN', 'false'));
-  const codeRxStr   = env('IMAP_CODE_REGEX', '(?<!\\d)\\d{6}(?!\\d)');
   const since       = new Date(Date.now() - lookbackMin * 60 * 1000);
 
   const client = new ImapFlow({ host, port, secure, auth: { user, pass }, logger: false, tls: { minVersion: 'TLSv1.2' }});
@@ -212,16 +214,16 @@ async function get2faCodeFromImap() {
 
       let uids = [];
       try { uids = await client.search(q); } catch {}
-      if (!uids.length && subjectFilt) {
-        try { uids = await client.search({ subject: subjectFilt }); } catch {}
-      }
+      if (!uids.length && subjectFilt) { try { uids = await client.search({ subject: subjectFilt }); } catch {} }
       uids = Array.from(new Set(uids)).sort((a,b)=>b-a).slice(0, 100);
 
       for (const uid of uids) {
         const m = await client.fetchOne(uid, { source: true, envelope: true, flags: true, internalDate: true }).catch(() => null);
         if (!m) continue;
         if (onlyUnseen && m.flags?.includes('\\Seen')) continue;
-        if (m.internalDate && +new Date(m.internalDate) < +since) continue;
+        const when = m.internalDate ? +new Date(m.internalDate) : 0;
+        if (when && when < +since) continue;
+        if (notBefore && when && when < notBefore) continue;
 
         let parsed = null;
         try { parsed = await simpleParser(m.source); } catch {}
@@ -230,15 +232,23 @@ async function get2faCodeFromImap() {
           parsed?.text ?? '',
           String(parsed?.html ?? '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ')
         ].join('  ');
+
         try {
-          const rx = new RegExp(codeRxStr, 'g');
+          const rx = new RegExp(env('IMAP_CODE_REGEX', '(?<!\\d)\\d{6}(?!\\d)'), 'g');
           const mm = hay.match(rx);
-          if (mm && mm[0]) return mm[0];
+          if (mm && mm[0]) {
+            if (markSeen) { try { await client.messageFlagsAdd(uid, ['\\Seen']); } catch {} }
+            return mm[0];
+          }
         } catch {}
+
         const spaced = hay.match(/(?<!\d)(?:\d[\s-]*){6}(?!\d)/);
         if (spaced && spaced[0]) {
           const only = spaced[0].replace(/[^\d]/g, '');
-          if (only.length === 6) return only;
+          if (only.length === 6) {
+            if (markSeen) { try { await client.messageFlagsAdd(uid, ['\\Seen']); } catch {} }
+            return only;
+          }
         }
       }
     }
@@ -246,6 +256,19 @@ async function get2faCodeFromImap() {
     try { await client.logout(); } catch {}
   }
   return null;
+}
+
+async function waitFor2faCode(notBefore = null, lastCode = null) {
+  const maxWaitMs = numEnv('MFA_MAX_WAIT_MS', 90_000);
+  const pollMs    = numEnv('IMAP_POLL_MS', 3000);
+  const end = Date.now() + maxWaitMs;
+
+  while (Date.now() < end) {
+    const code = await get2faCodeFromImap({ notBefore }).catch(() => null);
+    if (code && code !== lastCode) return code; // don’t reuse
+    await new Promise(r => setTimeout(r, pollMs));
+  }
+  throw new Error('Timed out waiting for 2FA email');
 }
 async function waitFor2faCode() {
   const maxWaitMs = numEnv('MFA_MAX_WAIT_MS', 90_000);
@@ -271,17 +294,33 @@ async function twofaScreenPresent(page) {
 }
 async function submitTwofaCode(page, code) {
   const clean = String(code || '').replace(/\D/g, '');
+
   await withStablePage(page, async () => {
+    // single input first
     const single = page.getByRole('textbox', { name: /passcode|code/i }).first();
-    if (await single.count()) {
-      await single.fill(clean);
-    } else {
-      const guess = page
-        .locator('input[autocomplete="one-time-code"], input[name*="code" i], input[id*="code" i]')
-        .first();
-      await guess.fill(clean);
+    if (await single.count()) { await single.fill(clean); return; }
+
+    const guess = page
+      .locator('input[autocomplete="one-time-code"], input[name*="code" i], input[id*="code" i]')
+      .first();
+    if (await guess.count()) { await guess.fill(clean); return; }
+
+    // multi-input (6 boxes)
+    const digitInputs = page.locator([
+      'input[type="tel"][maxlength="1"]',
+      'input[type="text"][maxlength="1"]',
+      'input[aria-label*="digit" i]',
+      'input[name*="code" i][maxlength="1"]',
+      'input[id*="code" i][maxlength="1"]'
+    ].join(','));
+    const n = await digitInputs.count();
+    if (n >= 6) {
+      for (let i = 0; i < Math.min(clean.length, n); i++) {
+        await digitInputs.nth(i).fill(clean[i]).catch(() => {});
+      }
     }
   });
+
   await withStablePage(page, async () => {
     const submit = page.getByRole('button', { name: /verify|continue|submit/i }).first();
     if (await submit.count()) {
@@ -294,6 +333,7 @@ async function submitTwofaCode(page, code) {
     }
   });
 }
+
 async function readTwofaErrorHint(page) {
   return await withStablePage(page, async () => {
     const loc = page.locator('.validation-summary-errors, .field-validation-error, [role="alert"], .text-danger, .error');
@@ -884,33 +924,41 @@ const subjectLine = `Net ACH Export — ${humanRange(start, end)}`;
     try { onMfa = await twofaScreenPresent(page); } catch { onMfa = /\/mfa\b/i.test(page.url()); }
 
     if (onMfa) {
-      console.log('[2FA] screen detected — fetching code via IMAP…');
-      const attempts = numEnv('MFA_SUBMIT_ATTEMPTS', 3);
-      let done = false, lastErr = '';
+  console.log('[2FA] screen detected — fetching code via IMAP…');
+  const attempts = numEnv('MFA_SUBMIT_ATTEMPTS', 3);
+  let done = false, lastErr = '';
+  let lastCode = null;
+  let notBefore = new Date(Date.now() - numEnv('MFA_FIRST_LOOKBACK_MS', 2 * 60 * 1000));
 
-      for (let i = 1; i <= attempts; i++) {
-        try {
-          if (!/\/mfa\b/i.test(page.url()) && !(await twofaScreenPresent(page).catch(()=>false))) {
-            console.log('[2FA] page left MFA before submitting; continuing.');
-            done = true; break;
-          }
-        } catch {}
-        const code = await waitFor2faCode();
-        await submitTwofaCode(page, code);
-        const ok = await waitForPostTwofa(page, numEnv('MFA_POST_SUBMIT_WAIT_MS', 8000));
-        if (ok) { done = true; break; }
-        lastErr = await readTwofaErrorHint(page);
-        console.warn(`[2FA] attempt ${i}/${attempts} did not pass: ${lastErr || 'no hint'}`);
-        await clickTwofaResend(page);
-        await page.waitForTimeout(800);
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      if (!/\/mfa\b/i.test(page.url()) && !(await twofaScreenPresent(page).catch(()=>false))) {
+        console.log('[2FA] page left MFA before submitting; continuing.');
+        done = true; break;
       }
+    } catch {}
 
-      if (!done) {
-        await saveArtifacts(page, 'mfa-stuck', diagDir);
-        throw new Error(`2FA did not complete after retries: ${lastErr || 'unknown error'}`);
-      }
-      console.log('[2FA] done.');
-    } else {
+    const code = await waitFor2faCode(notBefore, lastCode);
+    lastCode = code;
+
+    await submitTwofaCode(page, code);
+    const ok = await waitForPostTwofa(page, numEnv('MFA_POST_SUBMIT_WAIT_MS', 8000));
+    if (ok) { done = true; break; }
+
+    lastErr = await readTwofaErrorHint(page);
+    console.warn(`[2FA] attempt ${i}/${attempts} did not pass: ${lastErr || 'no hint'}`);
+
+    await clickTwofaResend(page);
+    notBefore = new Date(Date.now() - numEnv('MFA_RESEND_BARRIER_MS', 2000)); // accept only newer mail
+    await page.waitForTimeout(800);
+  }
+
+  if (!done) {
+    await saveArtifacts(page, 'mfa-stuck', diagDir);
+    throw new Error(`2FA did not complete after retries: ${lastErr || 'unknown error'}`);
+  }
+  console.log('[2FA] done.');
+} else {
       console.log('[2FA] screen not detected; continuing.');
     }
 
